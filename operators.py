@@ -601,6 +601,31 @@ def _drain_log_buffer(ctx: Any, buffer: _ProgressLogBuffer) -> Iterator[Any]:
         yield ctx.ops.set_progress(label=msg)
 
 
+def _label_debug_str(label: Any) -> str:
+    """One-line summary of a FiftyOne label for browser console logging."""
+    if isinstance(label, fo.Polylines):
+        n = len(label.polylines)
+        if n and label.polylines[0].points:
+            sample_pts = str(label.polylines[0].points[0])[:80]
+            return f"{n} polyline(s) | first label={label.polylines[0].label!r} pts[0]={sample_pts}"
+        return f"{n} polyline(s) (empty)"
+    if isinstance(label, fo.Detections):
+        return f"{len(label.detections)} detection(s)"
+    if isinstance(label, fo.Keypoints):
+        return f"{len(label.keypoints)} keypoint(s)"
+    if isinstance(label, fo.TemporalDetections):
+        return f"{len(label.detections)} temporal detection(s)"
+    if isinstance(label, fo.Classifications):
+        return f"{len(label.classifications)} classification(s)"
+    if isinstance(label, fo.Classification):
+        return f"label={label.label!r} confidence={label.confidence}"
+    if isinstance(label, str):
+        return repr(label[:80])
+    if label is None:
+        return "None"
+    return repr(label)[:100]
+
+
 async def _predict_with_progress(
     ctx: Any,
     view: Any,
@@ -635,6 +660,16 @@ async def _predict_with_progress(
             yield tick
 
         label = predict_task.result()
+
+        # Browser console: raw API response + parsed label for each sample.
+        raw = getattr(model, "_last_raw_content", "") or ""
+        yield ctx.ops.console_log(
+            f"[perceptron] [{i+1}/{total}] raw response ({len(raw)} chars): {raw!r}"
+        )
+        yield ctx.ops.console_log(
+            f"[perceptron] [{i+1}/{total}] parsed label: {_label_debug_str(label)}"
+        )
+
         status = on_sample(sample, label, i)
 
         # Surface every `[perceptron]` log line from this iteration as its own
