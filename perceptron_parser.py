@@ -21,10 +21,10 @@ Conventions:
       raw text and re-attach positionally.
     * `<clip>` tags are NOT supported by `extract_points`; we parse them with
       our own regex (with a prose fallback for ambiguous events).
-    * Polygon output (Mk1): the model currently collapses polygon responses to
-      bounding-box shapes . We parse these boxes and
-      convert each to a closed 4-point `fo.Polyline`. Update `_parse_polygons`
-      when the API returns true polygon coordinates.
+    * Polygon output: the API emits ``<polygon mention="LABEL"> (x,y) ... </polygon>``
+      with true polygon coordinates in the 0-1000 space. A ``<collection>`` wrapper
+      may group multiple polygon tags under one class label. See `_parse_polygons`
+      and the ``_POLYGON_*`` regex constants.
 
 """
 
@@ -207,6 +207,26 @@ def _detect_wrapper(content: str) -> tuple[str, str] | None:
 # raw text and pair timestamps to parsed objects positionally.
 # ---------------------------------------------------------------------------
 
+
+# ---------------------------------------------------------------------------
+# Polygon tag parsing. The API emits ``<polygon mention="LABEL"> (x,y) ... </polygon>``
+# with coordinates as space-separated integer pairs in the 0-1000 space.
+# A ``<collection mention="LABEL">`` wrapper may group multiple polygon tags.
+# ---------------------------------------------------------------------------
+
+# Matches a full <polygon ...> ... </polygon> block; captures attrs and body separately.
+_POLYGON_TAG_RE = re.compile(
+    r"<polygon\b(?P<attrs>[^>]*)>(?P<body>.*?)</polygon>",
+    re.DOTALL | re.IGNORECASE,
+)
+
+# Extracts mention="VALUE" from a polygon tag's attribute string.
+_POLYGON_MENTION_RE = re.compile(r'\bmention\s*=\s*"([^"]*)"', re.IGNORECASE)
+
+# Extracts integer (x,y) coordinate pairs from a polygon tag's body.
+_POLYGON_COORD_RE = re.compile(r"\((\d+),\s*(\d+)\)")
+
+# ---------------------------------------------------------------------------
 
 _TIME_NUM_RE = re.compile(r"(\d+(?:\.\d+)?)")
 
@@ -617,38 +637,47 @@ def _parse_points(content: str, *, target: str | None) -> fo.Keypoints:
 
 
 def _parse_polygons(content: str, *, target: str | None) -> fo.Polylines:
-    """Parse polygon output into `fo.Polylines`.
+    """Parse ``<polygon>`` tags into `fo.Polylines`.
 
-    Mk1 currently returns bbox-as-polygon responses ,
-    so we extract bounding boxes from the response and convert each to a closed
-    4-corner `fo.Polyline`. Wrapper handling is identical to `_parse_boxes`.
+    The API emits two variants:
 
-    When the API returns true polygon coordinates, replace the box extraction
-    with a dedicated polygon parser here.
+    1. Bare polygon with inline mention::
+
+           <polygon mention="bull"> (325,1000) (330,819) ... </polygon>
+
+    2. Collection wrapper where the mention labels the whole group::
+
+           <collection mention="person">
+             <polygon> (702,735) ... </polygon>
+             <polygon> (939,738) ... </polygon>
+           </collection>
+
+    Coordinates are space-separated ``(x,y)`` pairs in the 0-1000 space.
+    Each polygon becomes a closed, filled `fo.Polyline` in [0,1] relative coords.
     """
-    boxes = extract_points(content, expected="box")
     wrapper = _detect_wrapper(content)
     ctx = _resolve_wrapper_context(wrapper, target=target)
 
     polylines: list[fo.Polyline] = []
-    for box in boxes:
-        if not box.mention and ctx.label_fallback:
-            box.mention = ctx.label_fallback
-        x1, y1, x2, y2 = _box_coords(box)
-        # ``points`` is a list-of-lists so one Polyline can hold multiple
-        # disconnected shapes; we always have exactly one shape per response tag.
-        polylines.append(fo.Polyline(
-            label=box.mention or "object",
-            points=[[(x1, y1), (x2, y1), (x2, y2), (x1, y2)]],
-            closed=True,
-            filled=True,
-        ))
+    for m in _POLYGON_TAG_RE.finditer(content):
+        attrs_str = m.group("attrs")
+        body = m.group("body")
 
-    logger.info(
-        "[perceptron] parsed %d polygon(s) (bbox-as-polyline); wrapper=%s",
-        len(polylines),
-        wrapper,
-    )
+        # Prefer mention on the tag itself; fall back to wrapper label / target.
+        mention_m = _POLYGON_MENTION_RE.search(attrs_str)
+        label = (mention_m.group(1) if mention_m else None) or ctx.label_fallback or target or "object"
+
+        # Extract (x,y) integer pairs from the tag body and normalise to [0,1].
+        raw_pts = _POLYGON_COORD_RE.findall(body)
+        if not raw_pts:
+            logger.warning("[perceptron] polygon tag with no coordinate pairs; skipping")
+            continue
+
+        points = [(int(x) / COORD_MAX, int(y) / COORD_MAX) for x, y in raw_pts]
+        # points is a list-of-lists: one sub-list per disconnected shape.
+        polylines.append(fo.Polyline(label=label, points=[points], closed=True, filled=True))
+
+    logger.info("[perceptron] parsed %d polygon(s); wrapper=%s", len(polylines), wrapper)
     return fo.Polylines(polylines=polylines)
 
 

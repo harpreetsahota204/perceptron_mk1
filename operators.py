@@ -158,9 +158,8 @@ _BOOTSTRAP_TASK_LONG: dict[Task, str] = {
     Task.POLYGON: (
         "**Polygon**  \n"
         "Single-shot polygon grounding on images. Sends one `image_url` request per sample and writes "
-        "`fo.Polylines` (closed, filled) at the sample level.  \n\n"
-        "**Note:** Mk1 currently collapses polygon responses to bounding-box shapes. Results will "
-        "appear as rectangular polylines until the model natively supports polygon output."
+        "`fo.Polylines` (closed, filled) at the sample level. Each detected object is outlined with "
+        "a true polygon contour."
     ),
     Task.TRACK: (
         "**Track**  \n"
