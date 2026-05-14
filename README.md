@@ -213,9 +213,6 @@ objects, accepting the additional latency cost.
 | `keypoints` | `fo.Keypoints` at sample level | image |
 | `polygon` | `fo.Polylines` at sample level | image |
 
-> **Note on polygons:** Mk1 currently returns bounding-box-shaped polygon
-> responses. Detections will appear as rectangular polylines until the model
-> natively supports free-form polygon output.
 
 ### Video tasks
 
