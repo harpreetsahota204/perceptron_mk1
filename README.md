@@ -36,29 +36,19 @@ your data curation workflow. Use it to search, annotate, and understand your
 
 ## Install
 
-**Requirements:** FiftyOne ≥ 0.22, Python ≥ 3.11
+**Requirements:**  Python ≥ 3.11
 
 ```bash
-pip install openai perceptron opencv-python
+pip install fiftyone openai perceptron opencv-python
 ```
 
 `opencv-python` is only needed for the **Track** task (per-frame video decomposition).
 
 ### Install the plugin
 
-Symlink this directory into your FiftyOne plugins folder:
 
 ```bash
-PLUGINS_DIR="$(python -c 'import fiftyone as fo; print(fo.config.plugins_dir)')"
-ln -s "$(pwd)/perceptron-fiftyone" "$PLUGINS_DIR/perceptron-fiftyone"
-```
-
-Verify it's loaded:
-
-```python
-import fiftyone.plugins as fop
-[p.name for p in fop.list_plugins() if 'perceptron' in p.name]
-# -> ['@harpreetsahota/perceptron']
+fiftyone plugins download https://github.com/harpreetsahota204/perceptron-mk1
 ```
 
 ### Set your API key
@@ -73,6 +63,12 @@ export PERCEPTRON_API_KEY="ak.<your-key>"
 The plugin reads the key from FiftyOne's secret system — you never paste it
 into the form. The form shows a clear error if the key isn't set before you
 run anything.
+
+Then, launch the FiftyOne App:
+
+```bash
+fiftyone app launch
+```
 
 ---
 
@@ -112,7 +108,9 @@ Classify, VQA, Caption) skip this check entirely.
 *Find the exact moment something specific happens across a video dataset.*
 
 1. Open the operator, pick **Event Search**
+
 2. Describe the event: `a person opens a vehicle door`
+
 3. Click **Execute**
 
 Every video that matched gets a `fo.TemporalDetection` pinpointing the moment
@@ -170,51 +168,6 @@ a label describing what happened.
 
 To search for a *specific* event rather than letting the model choose freely,
 use **Event Search** mode instead.
-
----
-
-## Walkthrough: Caption a dataset, then search by meaning
-
-*Add captions to every sample, then use them for free-text retrieval.*
-
-1. Open the operator, pick **Bootstrap Labels → Caption (detailed)**
-2. Set the output field: `caption`
-3. Click **Execute**
-
-Once captions are written, use FiftyOne Brain to index them for semantic
-search:
-
-```python
-import fiftyone.brain as fob
-
-fob.compute_similarity(
-    dataset,
-    text_field="caption",
-    brain_key="caption_sim",
-)
-
-view = dataset.sort_by_similarity("busy urban intersection at night", k=20, brain_key="caption_sim")
-```
-
----
-
-## Walkthrough: Per-frame tracking on video
-
-*Write bounding-box detections on every sampled frame of a video dataset.*
-
-1. Open the operator on a video dataset, pick **Bootstrap Labels → Track**
-2. Enter a target: `pedestrian`
-3. Set a stride (default 3 — every 3rd frame)
-4. Click **Execute**
-
-The form shows a cost preview before you submit: *"~N API calls per video,
-~M total."* The plugin extracts frames via OpenCV, sends each as an image-mode
-request, and writes `fo.Detections` to `sample.frames[i][field]` based on each
-frame's timestamp.
-
-**Note:** The model is not explicitly trained for multi-object tracking, so
-cross-frame instance IDs are not guaranteed. For stable track IDs, run a
-downstream tracker (e.g. ByteTrack) over the per-frame detections.
 
 ---
 
@@ -281,75 +234,3 @@ objects, accepting the additional latency cost.
 | `caption_concise` | text | sample |
 | `caption_detailed` | text (includes visible signage) | sample |
 | `vqa` | text | sample |
-
----
-
-## Zoo model source (scripted use)
-
-The same directory works as a remote zoo model source for scripted bulk
-inference without the App:
-
-```python
-import fiftyone as fo
-import fiftyone.zoo as foz
-
-foz.register_zoo_model_source(
-    "https://github.com/harpreetsahota/perceptron-fiftyone"
-)
-
-# Image dataset example
-dataset = fo.load_dataset("my_images")
-model = foz.load_zoo_model("perceptron/mk1", task="detect", target="car", media_type="image")
-dataset.apply_model(model, label_field="perceptron_detections")
-
-# Video dataset example
-dataset = fo.load_dataset("my_videos")
-model = foz.load_zoo_model("perceptron/mk1", task="key_moments", media_type="video")
-dataset.apply_model(model, label_field="perceptron_key_moments")
-```
-
----
-
-## Troubleshooting
-
-**"PERCEPTRON_API_KEY is not set."**
-Export the key in the shell you used to launch FiftyOne. Setting it after
-launch does not propagate — restart the server.
-
-**"Mixed-media datasets are not supported."**
-This dataset contains both images and videos. Filter the view to a single media
-type (e.g. `dataset.match(F("media_type") == "video")`) before opening the
-operator.
-
-**"Compute video metadata before running Perceptron."**
-Run `dataset.compute_metadata()` once on the dataset and re-launch the
-operator. The Event Search and Track tasks need `metadata.frame_rate` to
-convert timestamp output into frame indices.
-
-**"Model does not exist" or 401 errors.**
-Your API key does not have access to Perceptron Mk1. Contact
-[platform.perceptron.inc](https://platform.perceptron.inc) to request access.
-
-**`N dropped` in the progress label or run summary.**
-Perceptron returned per-frame detections without `t=` timestamps, or
-`metadata.frame_rate` is missing on some samples. Check the `[perceptron]`
-warning lines in the server console for the affected file paths.
-
-**Plugin not appearing in the App.**
-Check that the symlink points to the right directory and restart
-`python -m fiftyone.server.main`. Any Python syntax error in the plugin files
-will appear in the server logs on startup.
-
----
-
-## Viewing logs
-
-Every significant action emits a `[perceptron]`-prefixed log line. To see
-them clearly, run the FiftyOne server in a dedicated terminal:
-
-```bash
-# Terminal 1: server logs appear here
-python -m fiftyone.server.main
-
-# Terminal 2: open http://localhost:5151 in your browser
-```
