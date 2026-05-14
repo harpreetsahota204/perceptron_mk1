@@ -141,9 +141,6 @@ _POLYGON_TEMPLATE: Final[str] = (
     "Your goal is to segment out the following categories with polygon outlines: {target}"
 )
 
-# Video dense TRACK reuses the same detection prompt (applied per frame).
-_CANONICAL_DETECT_CLASSES: Final[str] = _DETECT_TEMPLATE
-
 # Moment-pinpoint phrasing. Empirically produces a single-frame <clip ... />
 # tag (support=[N, N] in the resulting fo.TemporalDetection). The previous
 # "Identify when {target}." phrasing emitted prose with no <clip> tag.
@@ -217,7 +214,7 @@ def default_user_prompt(
                 raise ValueError(
                     "task=track requires a non-empty target (the object to detect per frame)"
                 )
-            return _CANONICAL_DETECT_CLASSES.format(target=target)
+            return _DETECT_TEMPLATE.format(target=target)
 
         case Task.FIND_EVENT:
             if not target:

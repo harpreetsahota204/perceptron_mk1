@@ -87,12 +87,6 @@ _CLASSIFY_JSON_SCHEMA: dict[str, Any] = {
 }
 
 
-# `vision_config` is the documented Perceptron API extension for steering
-# output format and toggling thinking. Sent via OpenAI's ``extra_body``.
-# Supported annotation_format values: "box", "point", "polygon", "clip".
-# Note: Mk1 currently collapses polygon responses to bbox-as-polygon shapes
-
-
 @dataclass(slots=True, kw_only=True, frozen=True)
 class PerceptronConfig:
     """Immutable configuration for one `PerceptronModel` instance.
@@ -115,9 +109,9 @@ class PerceptronConfig:
         enable_thinking: Sets ``vision_config.enable_thinking``. Off by
             default -- thinking is expensive and can demote structured
             output to prose for weakly-prompted clip tasks.
-        focus: Sets ``vision_config.internal_tools.focus``. When ``True``
-            (default) the model applies internal focusing tools to sharpen
-            grounding and clip extraction. Set to ``False`` to disable.
+        focus: Sets ``vision_config.internal_tools.focus``. Off by default;
+            when ``True`` the model zooms into regions and re-runs inference
+            on crops, sharpening grounding results.
         max_completion_tokens: Output ceiling per call.
         temperature: Sampling temperature.
         stride: For TRACK (dense path), send every Nth frame. Ignored for
@@ -329,6 +323,12 @@ class PerceptronModel(Model):
     # -- Video-mode predict (one ``video_url`` request) --------------------------
 
     def _predict_video(self, filepath: str, sample: fo.Sample | None) -> FOLabel:
+        """Single-shot inference on one video file.
+
+        Encodes the video as a base64 data URI and sends a single ``video_url``
+        request. Returns a sample-level label container (TemporalDetections for
+        clip tasks, Classification/str for shared tasks).
+        """
         prompt = self._resolve_prompt()
         messages = self._build_video_messages(video_path=filepath, prompt=prompt)
         vision_config = self._build_vision_config()
@@ -463,9 +463,14 @@ class PerceptronModel(Model):
     def _build_vision_config(self) -> dict[str, Any] | None:
         """Compose the ``vision_config`` extension for this task.
 
+        Sent via OpenAI's ``extra_body``. Supported ``annotation_format``
+        values: ``"box"``, ``"point"``, ``"polygon"``, ``"clip"``.
         ``annotation_format`` and ``enable_thinking`` are only added when
         relevant. ``internal_tools.focus`` is always included so the API
         receives the user's preference regardless of task type.
+
+        Note: Mk1 currently returns bbox-shaped polygons for polygon tasks
+        rather than true contour polygons. The parser handles both shapes.
         """
         cfg: dict[str, Any] = {}
         fmt = TASK_TO_API_FORMAT[self._config.task]

@@ -202,13 +202,6 @@ def _detect_wrapper(content: str) -> tuple[str, str] | None:
 
 
 # ---------------------------------------------------------------------------
-# Per-tag timestamp recovery. `extract_points()` returns objects with
-# ``t=None`` even when the source tag had ``t="X seconds"``. We re-scan the
-# raw text and pair timestamps to parsed objects positionally.
-# ---------------------------------------------------------------------------
-
-
-# ---------------------------------------------------------------------------
 # Polygon tag parsing. The API emits ``<polygon mention="LABEL"> (x,y) ... </polygon>``
 # with coordinates as space-separated integer pairs in the 0-1000 space.
 # A ``<collection mention="LABEL">`` wrapper may group multiple polygon tags.
@@ -226,6 +219,11 @@ _POLYGON_MENTION_RE = re.compile(r'\bmention\s*=\s*"([^"]*)"', re.IGNORECASE)
 # Extracts integer (x,y) coordinate pairs from a polygon tag's body.
 _POLYGON_COORD_RE = re.compile(r"\((\d+),\s*(\d+)\)")
 
+
+# ---------------------------------------------------------------------------
+# Per-tag timestamp recovery. `extract_points()` returns objects with
+# ``t=None`` even when the source tag had ``t="X seconds"``. We re-scan the
+# raw text and pair timestamps to parsed objects positionally.
 # ---------------------------------------------------------------------------
 
 _TIME_NUM_RE = re.compile(r"(\d+(?:\.\d+)?)")

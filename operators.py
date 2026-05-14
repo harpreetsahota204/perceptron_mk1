@@ -261,8 +261,7 @@ _BOOTSTRAP_DEFAULT_FIELDS: dict[Task, str] = {
 
 
 # Semantic Search: strict json_schema constraining `label` to {"yes", "no"}.
-# Replaces the previous fenced-JSON-via-system-prompt approach now that
-# native `response_format=json_schema` is verified working on Mk1.
+# Uses native response_format=json_schema rather than prompt-side fenced JSON.
 _SEMANTIC_SEARCH_RESPONSE_FORMAT: dict[str, Any] = {
     "type": "json_schema",
     "json_schema": {
@@ -509,22 +508,15 @@ class RunPerceptron(foo.Operator):
     async def execute(self, ctx: Any) -> AsyncIterator[dict[str, Any]]:
         """Async-generator dispatcher across the three modes.
 
-        Async so each per-mode executor can run the blocking API call in
-        `asyncio.to_thread(...)` while the main coroutine yields ticker
-        events that update "Elapsed" / "Total Tokens" rows live. FiftyOne's
-        SSE streamer accepts either Iterator or AsyncIterator.
-
-        Two log handlers are attached to the ``"perceptron"`` logger:
-            * `foo.ProgressHandler` -- routes records to `ctx.set_progress`,
-              which is what the *delegated* runner persists (Enterprise
-              "Runs" page).
-            * `_ProgressLogBuffer` -- buffered + drained inside each
-              per-sample loop and yielded as `ctx.ops.set_progress` events,
-              which is the only path that reaches the *immediate*-run
-              progress modal.
-        Each handler is a no-op in the other's domain.
+        Each per-mode executor runs the blocking API call in
+        ``asyncio.to_thread`` while this coroutine yields live ticker events.
         """
         mode = ctx.params["mode"]
+        # Two log handlers on the "perceptron" logger for the run's duration:
+        #   ProgressHandler  -- routes to ctx.set_progress for delegated runs.
+        #   _capture_perceptron_logs -- buffers records for the immediate-run
+        #     SSE modal (the only path that reaches the progress spinner).
+        # Each is a no-op in the other's domain.
         with foo.ProgressHandler(ctx, logger=logger), _capture_perceptron_logs() as logbuf:
             match mode:
                 case "event_search":
@@ -825,7 +817,7 @@ def _render_bootstrap_inputs(inputs: Any, ctx: Any, *, media_type: str) -> None:
             default=f"**Prompt:** `{preview}`",
         )
     except ValueError:
-        pass  # target is required but truly absent (no spec label fallback)
+        pass  # task requires a target but none is typed yet; skip the preview
 
     # Dense path (TRACK) needs stride / max_frames controls + cost preview.
     if task_supports_per_frame(task):
