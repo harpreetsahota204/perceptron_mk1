@@ -1,0 +1,14 @@
+{
+  "name": "harpreetsahota/perceptron",
+  "url": "https://github.com/harpreetsahota/perceptron-fiftyone",
+  "models": [
+    {
+      "base_name": "perceptron/mk1",
+      "base_filename": "perceptron_mk1.marker",
+      "author": "Perceptron",
+      "license": "Proprietary (API)",
+      "description": "Perceptron Mk1 (\"Mark One\") -- frontier video and embodied-reasoning model via the public chat-completions API. Supports per-frame tracking, keypoints, clip-event detection, captioning, classification, and VQA on video samples.",
+      "tags": ["perceptron", "mk1", "vision", "video", "tracking", "keypoints", "vqa", "captioning", "classification"]
+    }
+  ]
+}

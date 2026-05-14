@@ -1,0 +1,12 @@
+name: "@harpreetsahota/perceptron"
+type: plugin
+version: "0.1.0"
+author: "Harpreet Sahota"
+license: "Apache-2.0"
+description: "Use Perceptron on video datasets in FiftyOne for event search, semantic search, and label bootstrapping."
+fiftyone:
+  version: ">=0.22.0"
+operators:
+  - run_perceptron
+secrets:
+  - PERCEPTRON_API_KEY
