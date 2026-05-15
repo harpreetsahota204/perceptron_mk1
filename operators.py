@@ -209,23 +209,23 @@ _BOOTSTRAP_TASK_LONG: dict[Task, str] = {
 # Tasks absent from this dict (captions, KEY_MOMENTS) have no target slot.
 _TARGET_FIELD_SPEC: dict[Task, dict[str, Any]] = {
     Task.DETECT: {
-        "label": "Target object",
-        "description": "Object class to detect (e.g. 'car', 'person').",
+        "label": "Classes",
+        "description": "One or more object classes to detect (e.g. 'car', 'person').",
         "required": True,
     },
     Task.KEYPOINTS: {
-        "label": "Target object",
-        "description": "Object to point at (e.g. 'pedestrian').",
+        "label": "Classes",
+        "description": "One or more object classes to point at (e.g. 'pedestrian').",
         "required": True,
     },
     Task.POLYGON: {
-        "label": "Target object",
-        "description": "Object class to outline (e.g. 'vehicle').",
+        "label": "Classes",
+        "description": "One or more object classes to outline (e.g. 'vehicle').",
         "required": True,
     },
     Task.TRACK: {
-        "label": "Target object",
-        "description": "Object class to detect per frame (e.g. 'armored vehicle').",
+        "label": "Classes",
+        "description": "One or more object classes to detect per frame (e.g. 'armored vehicle').",
         "required": True,
     },
     Task.CLASSIFY_SINGLE: {
@@ -235,7 +235,7 @@ _TARGET_FIELD_SPEC: dict[Task, dict[str, Any]] = {
     },
     Task.CLASSIFY_MULTI: {
         "label": "Aspects to list (optional)",
-        "description": "Aspects to enumerate (e.g. 'scene, vehicles, lighting').",
+        "description": "Aspects to enumerate (e.g. 'scene', 'vehicles', 'lighting').",
         "required": False,
     },
     Task.VQA: {
@@ -802,11 +802,23 @@ def _render_bootstrap_inputs(inputs: Any, ctx: Any, *, media_type: str) -> None:
     # Caption and KEY_MOMENTS tasks have no target input.
     spec = _TARGET_FIELD_SPEC.get(task)
     if spec is not None:
-        inputs.str("bootstrap_target", **spec)
+        class_view = types.ListView()
+        inputs.list(
+            "bootstrap_target",
+            types.String(),
+            label=spec["label"],
+            required=spec.get("required", False),
+            description=spec.get("description", ""),
+            view=class_view,
+        )
 
     # Live prompt preview. Uses the spec label as the placeholder when the
     # target is empty so users see the grammar even before they start typing.
-    target = (ctx.params.get("bootstrap_target") or "").strip()
+    _raw_target = ctx.params.get("bootstrap_target") or []
+    if isinstance(_raw_target, list):
+        target = ", ".join(t.strip() for t in _raw_target if t and t.strip())
+    else:
+        target = str(_raw_target).strip()
     placeholder = f"<{spec['label'].lower()}>" if spec else None
     preview_target = target or placeholder
     try:
@@ -1305,7 +1317,11 @@ async def _execute_bootstrap(
     ctx: Any, version: str, logbuf: _ProgressLogBuffer
 ) -> AsyncIterator[dict[str, Any]]:
     task = Task(ctx.params["bootstrap_task"])
-    target = (ctx.params.get("bootstrap_target") or "").strip() or None
+    _raw_target = ctx.params.get("bootstrap_target") or []
+    if isinstance(_raw_target, list):
+        target: str | None = ", ".join(t.strip() for t in _raw_target if t and t.strip()) or None
+    else:
+        target = str(_raw_target).strip() or None
     field = (ctx.params.get("bootstrap_field") or _BOOTSTRAP_DEFAULT_FIELDS[task]).strip()
     if not field:
         raise ValueError("Bootstrap Labels requires a non-empty output field name.")
