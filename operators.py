@@ -372,7 +372,19 @@ class RunPerceptron(foo.Operator):
             return types.Property(inputs)
 
         # 1. Media-type gate: read once here and thread through the form.
-        media_type = ctx.dataset.media_type  # "image", "video", or "mixed"
+        # Grouped datasets report media_type="group"; resolve to the effective
+        # type by inspecting the slice media types. Uniform-video groups are
+        # treated as video; uniform-image groups as image; mixed groups are blocked.
+        raw_media_type = ctx.dataset.media_type
+        if raw_media_type == "group":
+            slice_types = set(ctx.dataset.group_media_types.values())
+            if len(slice_types) == 1:
+                media_type = slice_types.pop()  # "video" or "image"
+            else:
+                media_type = "mixed"
+        else:
+            media_type = raw_media_type  # "image", "video", or "mixed"
+
         if media_type == "mixed":
             inputs.view(
                 "mixed_media_error",
