@@ -24,6 +24,8 @@ const SESSION_PREFIX = "perceptronChat:";
 interface StoredSession {
   turns: Turn[];
   enableThinking: boolean;
+  enableFocus: boolean;
+  hintFormat: string;
 }
 
 function loadSession(sampleId: string): StoredSession | null {
@@ -147,6 +149,9 @@ const PerceptronChatPanel: React.FC<Props> = ({ data, schema }) => {
   const [turns,    setTurns]    = useState<Turn[]>([]);
   const [question, setQuestion] = useState("");
   const [enableThinking, setEnableThinking] = useState(false);
+  const [enableFocus,    setEnableFocus]    = useState(false);
+  // "auto" = let the model decide; other values set annotation_format in vision_config.
+  const [hintFormat, setHintFormat] = useState("auto");
 
   // Streaming state for the active (in-progress) turn.
   const [streamState,   setStreamState]   = useState<StreamState>("idle");
@@ -200,6 +205,8 @@ const PerceptronChatPanel: React.FC<Props> = ({ data, schema }) => {
       log("restored session", { sample_id: newId, turns: cached.turns.length });
       setTurns(cached.turns);
       setEnableThinking(cached.enableThinking);
+      setEnableFocus(cached.enableFocus ?? false);
+      setHintFormat(cached.hintFormat ?? "auto");
     } else {
       setTurns([]);
     }
@@ -208,8 +215,8 @@ const PerceptronChatPanel: React.FC<Props> = ({ data, schema }) => {
   // ── Persist turns ─────────────────────────────────────────────────────────
   useEffect(() => {
     if (!sampleId) return;
-    saveSession(sampleId, { turns, enableThinking });
-  }, [turns, enableThinking, sampleId]);
+    saveSession(sampleId, { turns, enableThinking, enableFocus, hintFormat });
+  }, [turns, enableThinking, enableFocus, hintFormat, sampleId]);
 
   // ── Stream polling ────────────────────────────────────────────────────────
   useEffect(() => {
@@ -299,7 +306,8 @@ const PerceptronChatPanel: React.FC<Props> = ({ data, schema }) => {
     const historyForApi = [...turns];
     setTurns((prev) => [...prev, { role: "user", content: q }]);
 
-    log("ask →", { filepath, media_type: mediaType, history_len: historyForApi.length, enable_thinking: enableThinking });
+    log("ask →", { filepath, media_type: mediaType, history_len: historyForApi.length,
+                    enable_thinking: enableThinking, enable_focus: enableFocus, hint_format: hintFormat });
 
     try {
       const result = await ask({
@@ -308,6 +316,8 @@ const PerceptronChatPanel: React.FC<Props> = ({ data, schema }) => {
         question:        q,
         history:         historyForApi,
         enable_thinking: enableThinking,
+        enable_focus:    enableFocus,
+        hint_format:     hintFormat,
       });
       log("ask ← run_id:", result.run_id);
       runIdRef.current = result.run_id;
@@ -316,7 +326,7 @@ const PerceptronChatPanel: React.FC<Props> = ({ data, schema }) => {
       setStreamError(e?.message ?? "Request failed.");
       setStreamState("error");
     }
-  }, [question, streamState, filepath, mediaType, turns, enableThinking, ask]);
+  }, [question, streamState, filepath, mediaType, turns, enableThinking, enableFocus, hintFormat, ask]);
 
   const handleKeyDown = useCallback(
     (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
@@ -539,16 +549,54 @@ const PerceptronChatPanel: React.FC<Props> = ({ data, schema }) => {
                     background: V.bg2, display: "flex",
                     flexDirection: "column", gap: 7 }}>
 
-        <label style={{ display: "flex", alignItems: "center", gap: 6,
-                         cursor: "pointer", userSelect: "none",
-                         fontSize: 11, color: V.muted }}>
-          <input
-            type="checkbox" checked={enableThinking}
-            onChange={(e) => setEnableThinking(e.target.checked)}
-            style={{ width: 13, height: 13, cursor: "pointer", accentColor: V.primary, flexShrink: 0 }}
-          />
-          Enable thinking (slower, better for reasoning)
-        </label>
+        {/* Format hint + thinking toggle — same row */}
+        <div style={{ display: "flex", alignItems: "center", gap: 12, flexWrap: "wrap" as const }}>
+
+          {/* Output format selector */}
+          <div style={{ display: "flex", alignItems: "center", gap: 5, fontSize: 11, color: V.muted }}>
+            <span style={{ flexShrink: 0 }}>Output:</span>
+            <select
+              value={hintFormat}
+              onChange={(e) => setHintFormat(e.target.value)}
+              style={{
+                background: V.bg2, color: V.text,
+                border: `1px solid ${V.divider}`, borderRadius: 4,
+                padding: "2px 5px", fontSize: 11, fontFamily: V.font,
+                cursor: "pointer", outline: "none",
+              }}
+            >
+              <option value="auto">Auto (detect)</option>
+              <option value="box">Boxes</option>
+              <option value="point">Keypoints</option>
+              <option value="polygon">Polygons</option>
+              <option value="clip">Clips</option>
+            </select>
+          </div>
+
+          {/* Thinking toggle */}
+          <label style={{ display: "flex", alignItems: "center", gap: 6,
+                           cursor: "pointer", userSelect: "none",
+                           fontSize: 11, color: V.muted }}>
+            <input
+              type="checkbox" checked={enableThinking}
+              onChange={(e) => setEnableThinking(e.target.checked)}
+              style={{ width: 13, height: 13, cursor: "pointer", accentColor: V.primary, flexShrink: 0 }}
+            />
+            Thinking
+          </label>
+
+          {/* Focus toggle */}
+          <label style={{ display: "flex", alignItems: "center", gap: 6,
+                           cursor: "pointer", userSelect: "none",
+                           fontSize: 11, color: V.muted }}>
+            <input
+              type="checkbox" checked={enableFocus}
+              onChange={(e) => setEnableFocus(e.target.checked)}
+              style={{ width: 13, height: 13, cursor: "pointer", accentColor: V.primary, flexShrink: 0 }}
+            />
+            Focus
+          </label>
+        </div>
 
         <div style={{ display: "flex", gap: 6, alignItems: "flex-end" }}>
           <textarea

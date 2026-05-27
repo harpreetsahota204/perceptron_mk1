@@ -71,7 +71,11 @@ from .perceptron_parser import to_fiftyone
 
 _STATUS_DIR = Path.home() / ".fiftyone" / "perceptron_chat"
 
-BASE_URL = "https://api.perceptron.inc/v1"
+# These mirror DEFAULT_BASE_URL / DEFAULT_TIMEOUT_SECONDS in perceptron_api.py.
+# They're intentionally local here because the chat panel uses the raw OpenAI
+# streaming client directly (stream=True) rather than PerceptronClient, which
+# only supports non-streaming calls.
+BASE_URL  = "https://api.perceptron.inc/v1"
 TIMEOUT_S = 300  # 5 min; video data URIs + reasoning can be slow
 
 
@@ -178,7 +182,7 @@ _DEFAULT_FIELDS: dict[str, str] = {
 def _run_stream_thread(
     api_key: str,
     messages: list[dict[str, Any]],
-    vision_config: dict[str, Any] | None,
+    vision_config: dict[str, Any],
     run_id: str,
 ) -> None:
     """Stream a Perceptron chat completion and write tokens to the stream file.
@@ -192,16 +196,12 @@ def _run_stream_thread(
     try:
         client = OpenAI(api_key=api_key, base_url=BASE_URL, timeout=TIMEOUT_S)
 
-        extra: dict[str, Any] = {}
-        if vision_config:
-            extra["extra_body"] = {"vision_config": vision_config}
-
         stream = client.chat.completions.create(
             model=DEFAULT_MODEL_NAME,
             messages=messages,
             stream=True,
             stream_options={"include_usage": True},
-            **extra,
+            extra_body={"vision_config": vision_config},
         )
 
         t0 = time.time()
@@ -214,9 +214,8 @@ def _run_stream_thread(
                 _append_stream(run_id, delta.content)
             # usage arrives on the final chunk when include_usage=True
             if getattr(chunk, "usage", None):
-                usage = chunk.usage
-                prompt_tokens = getattr(usage, "prompt_tokens", 0) or 0
-                completion_tokens = getattr(usage, "completion_tokens", 0) or 0
+                prompt_tokens    = getattr(chunk.usage, "prompt_tokens",    0) or 0
+                completion_tokens = getattr(chunk.usage, "completion_tokens", 0) or 0
 
         # Read back the full streamed content to detect any grounding tags.
         try:
@@ -236,12 +235,10 @@ def _run_stream_thread(
             "default_field": _DEFAULT_FIELDS.get(detected_format, "") if detected_format else "",
         })
 
-    except Exception as exc:
-        _write_json(_status_path(run_id), {
-            "status": "error",
-            "error": str(exc),
-        })
-        print(f"[perceptron_chat] inference error:\n{traceback.format_exc()}")
+    except Exception:
+        tb = traceback.format_exc()
+        _write_json(_status_path(run_id), {"status": "error", "error": tb})
+        print(f"[perceptron_chat] inference error:\n{tb}")
 
 
 # ---------------------------------------------------------------------------
@@ -359,6 +356,16 @@ class PerceptronChatPanel(foo.Panel):
             callers must pass plain-text content for all turns.
         enable_thinking : bool
             When true, sets ``vision_config.enable_thinking = True``.
+        enable_focus : bool
+            When true, sets ``vision_config.internal_tools.focus = True``
+            so the model zooms into regions and re-runs inference on crops.
+        hint_format : str
+            Optional output-format hint. One of ``"box"``, ``"point"``,
+            ``"polygon"``, ``"clip"``, or ``"auto"`` (default). When not
+            ``"auto"``, ``annotation_format`` is added to ``vision_config``
+            so the model steers its output toward that tag grammar. The
+            post-hoc ``_detect_format`` check still applies — if the model
+            ignores the hint, the Convert button will correctly not appear.
 
         Returns
         -------
@@ -369,26 +376,32 @@ class PerceptronChatPanel(foo.Panel):
         if not has_api_key(ctx):
             return {"error": "PERCEPTRON_API_KEY is not set."}
 
-        filepath   = ctx.params.get("filepath", "")
-        media_type = ctx.params.get("media_type", "image")
-        question   = (ctx.params.get("question") or "").strip()
+        filepath        = ctx.params.get("filepath", "")
+        media_type      = ctx.params.get("media_type", "image")
+        question        = (ctx.params.get("question") or "").strip()
         history: list[dict] = ctx.params.get("history", [])
         enable_thinking = bool(ctx.params.get("enable_thinking", False))
+        enable_focus    = bool(ctx.params.get("enable_focus", False))
+        hint_format     = ctx.params.get("hint_format", "auto")  # "auto" | "box" | "point" | "polygon" | "clip"
 
         if not question:
             return {"error": "Question cannot be empty."}
         if not filepath:
             return {"error": "No filepath provided."}
 
-        # Encode the current media as a data URI.
+        # Encode the current media as a data URI for the first user message.
         if media_type == "video":
-            media_url = to_video_data_uri(filepath)
-            media_part: dict[str, Any] = {"type": "video_url", "video_url": {"url": media_url}}
+            media_part: dict[str, Any] = {
+                "type": "video_url",
+                "video_url": {"url": to_video_data_uri(filepath)},
+            }
         else:
             img_bytes = Path(filepath).read_bytes()
             mime = mimetypes.guess_type(filepath)[0] or "image/jpeg"
-            media_url = to_image_data_uri(img_bytes, mime=mime)
-            media_part = {"type": "image_url", "image_url": {"url": media_url}}
+            media_part = {
+                "type": "image_url",
+                "image_url": {"url": to_image_data_uri(img_bytes, mime=mime)},
+            }
 
         # Build the messages array. The media is embedded in the first user
         # message only; subsequent turns are text so the context window isn't
@@ -422,9 +435,12 @@ class PerceptronChatPanel(foo.Panel):
             else:
                 messages.append({"role": "user", "content": question})
 
-        vision_config: dict[str, Any] = {"internal_tools": {"focus": False}}
+        vision_config: dict[str, Any] = {"internal_tools": {"focus": enable_focus}}
         if enable_thinking:
             vision_config["enable_thinking"] = True
+        if hint_format and hint_format != "auto":
+            # Steer the model toward a specific output tag grammar.
+            vision_config["annotation_format"] = hint_format
 
         # Unique run ID so concurrent panel instances don't share stream files.
         run_id = f"{ctx.current_sample or 'x'}_{int(time.time() * 1000)}"
