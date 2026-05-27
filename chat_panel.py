@@ -45,7 +45,6 @@ from __future__ import annotations
 
 import json
 import mimetypes
-import os
 import re
 import threading
 import time
@@ -53,9 +52,10 @@ import traceback
 from pathlib import Path
 from typing import Any
 
+import bson
+from fiftyone import ViewField as F
 from openai import OpenAI
 
-import fiftyone as fo
 import fiftyone.operators as foo
 import fiftyone.operators.types as types
 
@@ -117,10 +117,7 @@ def _append_stream(run_id: str, text: str) -> None:
 def _clear_run(run_id: str) -> None:
     """Remove stale stream + status files before starting a new inference."""
     for p in (_stream_path(run_id), _status_path(run_id)):
-        try:
-            p.unlink(missing_ok=True)
-        except OSError:
-            pass
+        p.unlink(missing_ok=True)
 
 
 # ---------------------------------------------------------------------------
@@ -291,7 +288,12 @@ class PerceptronChatPanel(foo.Panel):
     # ── Internal helpers ─────────────────────────────────────────────────────
 
     def _sync_sample(self, ctx) -> None:
-        """Push the active sample's filepath, sample ID, and media type to React."""
+        """Push the active sample's filepath, sample ID, media type, and frame
+        rate to React state.
+
+        For grouped datasets, resolves the active group slice so the panel
+        always reflects the slice currently visible in the modal.
+        """
         if not ctx.current_sample:
             return
 
@@ -299,17 +301,16 @@ class PerceptronChatPanel(foo.Panel):
         sample = dataset[ctx.current_sample]
         gf = dataset.group_field
 
+        resolved = sample  # will be replaced by the active slice if needed
         filepath = sample.filepath
         sample_id = ctx.current_sample
         media_type = getattr(sample, "media_type", None) or "image"
 
-        # For grouped datasets, resolve to the active group slice.
+        # For grouped datasets, resolve to the slice the user is viewing.
         if gf and ctx.group_slice:
             group_elem = sample[gf]
             if group_elem and group_elem.name != ctx.group_slice:
                 try:
-                    from fiftyone import ViewField as F
-                    import bson
                     slice_sample = (
                         dataset
                         .select_group_slices(ctx.group_slice)
@@ -317,22 +318,22 @@ class PerceptronChatPanel(foo.Panel):
                         .first()
                     )
                     if slice_sample is not None:
-                        filepath = slice_sample.filepath
-                        sample_id = slice_sample.id
+                        resolved   = slice_sample
+                        filepath   = slice_sample.filepath
+                        sample_id  = slice_sample.id
                         media_type = getattr(slice_sample, "media_type", None) or "image"
                 except Exception as exc:
                     print(f"[perceptron_chat] slice lookup error: {exc}")
 
         # frame_rate is needed by save_as_label to convert clip timestamps
-        # to FiftyOne frame indices. Gracefully absent on image samples.
+        # to frame indices. Read from the already-resolved sample to avoid
+        # a redundant database round-trip.
         frame_rate: float | None = None
-        try:
-            resolved = ctx.dataset[sample_id]
-            meta = resolved.metadata
-            if meta is not None:
-                frame_rate = float(meta.frame_rate) if getattr(meta, "frame_rate", None) else None
-        except Exception:
-            pass
+        meta = resolved.metadata
+        if meta is not None:
+            raw_fr = getattr(meta, "frame_rate", None)
+            if raw_fr:
+                frame_rate = float(raw_fr)
 
         ctx.panel.set_state("filepath",   filepath)
         ctx.panel.set_state("sample_id",  sample_id)

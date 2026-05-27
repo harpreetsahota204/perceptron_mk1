@@ -6,16 +6,16 @@ remote zoo model source.
 
 Module layout:
 
-    perceptron_api.py     -- HTTP client + retry/backoff
+    perceptron_api.py     -- HTTP client + retry/backoff + data URI helpers
     perceptron_parser.py  -- raw tag/JSON output -> FiftyOne label types
-    perceptron_model.py   -- `PerceptronModel` (SamplesMixin + Model)
-    prompts.py            -- canonical prompt templates and task enum
+    perceptron_model.py   -- `PerceptronModel` (image / video / dense dispatch)
+    prompts.py            -- Task enum, task-set constants, prompt templates
     _shared.py            -- helpers shared by the operator and zoo registration
-    operators.py          -- `RunPerceptron`: the single operator, with a
-                             conditional-input form for Event Search /
-                             Semantic Search / Bootstrap Labels modes.
-                             Accessible from the operator browser (backtick)
-                             or the grid-action button.
+    operators.py          -- `RunPerceptron`: conditional-input form operator
+                             for Event Search / Semantic Search / Bootstrap
+                             Labels (image and video datasets).
+    chat_panel.py         -- `PerceptronChatPanel`: streaming modal panel for
+                             asking free-form questions about a sample.
 
 Dual distribution:
     * As a plugin: drop this directory into FiftyOne's plugins dir; the

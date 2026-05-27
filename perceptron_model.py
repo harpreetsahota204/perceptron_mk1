@@ -197,10 +197,6 @@ class PerceptronModel(Model):
             self._client = PerceptronClient.from_env()
             key_source = "os.environ"
 
-        # Stores the raw API response content after each predict() call.
-        # Read by the operator layer to surface it to the browser console.
-        self._last_raw_content: str = ""
-
         logger.info(
             "[perceptron] PerceptronModel ready: model=%s task=%s target=%r "
             "enable_thinking=%s focus=%s max_completion_tokens=%d stride=%d "
@@ -229,15 +225,6 @@ class PerceptronModel(Model):
     @property
     def config(self) -> PerceptronConfig:
         return self._config
-
-    @property
-    def annotation_format(self) -> str | None:
-        """``vision_config.annotation_format`` for this task.
-
-        ``None`` for free-text and classify tasks, which send no
-        ``vision_config`` extension at all.
-        """
-        return TASK_TO_API_FORMAT[self._config.task]
 
     @property
     def parser_format(self) -> str:
@@ -312,7 +299,6 @@ class PerceptronModel(Model):
             max_completion_tokens=self._config.max_completion_tokens,
         )
         content = response.choices[0].message.content or ""
-        self._last_raw_content = content
         label = to_fiftyone(content, self.parser_format, target=self._config.target)
         logger.info(
             "[perceptron] predict produced %s",
@@ -351,7 +337,6 @@ class PerceptronModel(Model):
             max_completion_tokens=self._config.max_completion_tokens,
         )
         content = response.choices[0].message.content or ""
-        self._last_raw_content = content
         label = to_fiftyone(
             content,
             self.parser_format,
@@ -424,7 +409,6 @@ class PerceptronModel(Model):
                 max_completion_tokens=self._config.max_completion_tokens,
             )
             content = response.choices[0].message.content or ""
-            self._last_raw_content = content  # last frame wins; useful for spot-checking
             label = to_fiftyone(
                 content,
                 parser_format,

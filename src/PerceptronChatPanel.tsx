@@ -115,8 +115,10 @@ const FORMAT_LABELS: Record<string, string> = {
 };
 
 // ---------------------------------------------------------------------------
-// Props
+// Types
 // ---------------------------------------------------------------------------
+
+type StreamState = "idle" | "running" | "done" | "error";
 
 interface Props {
   data?:   PanelData;
@@ -147,7 +149,6 @@ const PerceptronChatPanel: React.FC<Props> = ({ data, schema }) => {
   const [enableThinking, setEnableThinking] = useState(false);
 
   // Streaming state for the active (in-progress) turn.
-  type StreamState = "idle" | "running" | "done" | "error";
   const [streamState,   setStreamState]   = useState<StreamState>("idle");
   const [streamingText, setStreamingText] = useState("");
   const [streamError,   setStreamError]   = useState<string | null>(null);

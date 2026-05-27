@@ -61,10 +61,9 @@ def to_video_data_uri(filepath: str | Path) -> str:
 def to_image_data_uri(data: bytes, *, mime: str = "image/jpeg") -> str:
     """Encode raw image bytes as a ``data:<mime>;base64,...`` URI.
 
-    Used by dense per-frame tasks (TRACK, KEYPOINTS) that extract frames
-    from a video and send them as image-mode requests. The caller is
-    responsible for encoding the frame to bytes (typically JPEG via cv2 or
-    PIL) before handing it here.
+    Used by the dense TRACK path (cv2-extracted JPEG frames) and by
+    ``_predict_image`` for single-shot image grounding tasks. The caller is
+    responsible for supplying the raw bytes and the correct MIME type.
     """
     b64 = base64.b64encode(data).decode("ascii")
     return f"data:{mime};base64,{b64}"
