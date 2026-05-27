@@ -34,14 +34,16 @@ import logging
 from pathlib import Path
 from typing import Any
 
+from .chat_panel import PerceptronChatPanel
 from .operators import RunPerceptron
 
 logger = logging.getLogger("perceptron")
 
 
 def register(plugin) -> None:
-    """Register the `RunPerceptron` operator with FiftyOne's plugin loader."""
+    """Register the RunPerceptron operator and PerceptronChatPanel."""
     plugin.register(RunPerceptron)
+    plugin.register(PerceptronChatPanel)
 
 
 def download_model(model_name: str, model_path: str) -> None:

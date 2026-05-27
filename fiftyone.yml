@@ -3,10 +3,12 @@ type: plugin
 version: "0.1.0"
 author: "Harpreet Sahota"
 license: "Apache-2.0"
-description: "Use Perceptron on video datasets in FiftyOne for event search, semantic search, and label bootstrapping."
+description: "Perceptron Mk1 integration for FiftyOne — grounding, event search, semantic search, label bootstrapping, and chat."
 fiftyone:
   version: ">=0.22.0"
 operators:
   - run_perceptron
+panels:
+  - perceptron_chat
 secrets:
   - PERCEPTRON_API_KEY
