@@ -4,13 +4,17 @@ Architecture
 ------------
 A hybrid modal panel. Python lifecycle hooks push the current sample's
 filepath and media type to React via ``ctx.panel.set_state()``. The React
-component calls two panel methods:
+component calls three panel methods:
 
     ``ask``             — validates params, starts an inference daemon thread
                           that streams tokens to a file, returns a run_id.
     ``get_stream_chunk``— reads new bytes from the stream file since the
                           caller's last cursor position; React polls every
                           250 ms to produce a live typing effect.
+    ``save_as_label``   — parses the completed stream content using the existing
+                          perceptron_parser and saves the resulting FiftyOne
+                          label to the sample. Only called when the response
+                          contained recognised grounding tags.
 
 Streaming pattern (identical to vlm_prompt_lab)
 -----------------------------------------------
@@ -42,6 +46,7 @@ from __future__ import annotations
 import json
 import mimetypes
 import os
+import re
 import threading
 import time
 import traceback
@@ -57,6 +62,7 @@ import fiftyone.operators.types as types
 from ._shared import get_api_key, has_api_key
 from .perceptron_api import to_image_data_uri, to_video_data_uri
 from .perceptron_model import DEFAULT_MODEL_NAME
+from .perceptron_parser import to_fiftyone
 
 # ---------------------------------------------------------------------------
 # Runtime file locations — OUTSIDE the plugin directory to avoid invalidating
@@ -118,6 +124,56 @@ def _clear_run(run_id: str) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Format detection + label helpers
+# ---------------------------------------------------------------------------
+
+
+def _detect_format(content: str) -> str | None:
+    """Detect grounding output format from a completed response.
+
+    Checks for known tag signatures and JSON key patterns. Priority order:
+    polygon > box (XML) > point > clip > bbox_2d (JSON). XML tags take
+    precedence over JSON so the canonical format is always preferred.
+    Returns ``None`` for plain-text responses — the Convert button is hidden.
+    """
+    if re.search(r"<polygon\b", content, re.IGNORECASE):
+        return "polygon"
+    if re.search(r"<point_box\b", content, re.IGNORECASE):
+        return "box"
+    if re.search(r"<point\b", content, re.IGNORECASE):
+        return "point"
+    if re.search(r"<clip\b", content, re.IGNORECASE):
+        return "clip"
+    # JSON bbox_2d array — checked last so XML tags always win.
+    if re.search(r'"bbox_2d"\s*:', content):
+        return "bbox2d"
+    return None
+
+
+def _count_label_items(label: Any) -> int:
+    """Best-effort item count for display in the save-success message."""
+    if hasattr(label, "detections"):
+        return len(label.detections)
+    if hasattr(label, "keypoints"):
+        return len(label.keypoints)
+    if hasattr(label, "polylines"):
+        return len(label.polylines)
+    if hasattr(label, "classifications"):
+        return len(label.classifications)
+    return 1
+
+
+# Default output field names shown in the Convert UI, one per format.
+_DEFAULT_FIELDS: dict[str, str] = {
+    "box":     "perceptron_detections",
+    "bbox2d":  "perceptron_detections",  # same output type as "box"
+    "point":   "perceptron_keypoints",
+    "polygon": "perceptron_polygons",
+    "clip":    "perceptron_events",
+}
+
+
+# ---------------------------------------------------------------------------
 # Inference thread
 # ---------------------------------------------------------------------------
 
@@ -165,11 +221,22 @@ def _run_stream_thread(
                 prompt_tokens = getattr(usage, "prompt_tokens", 0) or 0
                 completion_tokens = getattr(usage, "completion_tokens", 0) or 0
 
+        # Read back the full streamed content to detect any grounding tags.
+        try:
+            full_content = _stream_path(run_id).read_text(encoding="utf-8")
+        except OSError:
+            full_content = ""
+        detected_format = _detect_format(full_content)
+
         _write_json(_status_path(run_id), {
             "status": "done",
             "latency_ms": int((time.time() - t0) * 1000),
             "prompt_tokens": prompt_tokens,
             "completion_tokens": completion_tokens,
+            # None when the response is plain text; set to a format string when
+            # grounding tags are present so React can show the Convert button.
+            "detected_format": detected_format,
+            "default_field": _DEFAULT_FIELDS.get(detected_format, "") if detected_format else "",
         })
 
     except Exception as exc:
@@ -256,9 +323,21 @@ class PerceptronChatPanel(foo.Panel):
                 except Exception as exc:
                     print(f"[perceptron_chat] slice lookup error: {exc}")
 
-        ctx.panel.set_state("filepath", filepath)
-        ctx.panel.set_state("sample_id", sample_id)
+        # frame_rate is needed by save_as_label to convert clip timestamps
+        # to FiftyOne frame indices. Gracefully absent on image samples.
+        frame_rate: float | None = None
+        try:
+            resolved = ctx.dataset[sample_id]
+            meta = resolved.metadata
+            if meta is not None:
+                frame_rate = float(meta.frame_rate) if getattr(meta, "frame_rate", None) else None
+        except Exception:
+            pass
+
+        ctx.panel.set_state("filepath",   filepath)
+        ctx.panel.set_state("sample_id",  sample_id)
         ctx.panel.set_state("media_type", media_type)
+        ctx.panel.set_state("frame_rate", frame_rate)
 
     # ── Panel methods (called from React via usePanelEvent) ──────────────────
 
@@ -407,6 +486,67 @@ class PerceptronChatPanel(foo.Panel):
             "final_status": status if done else None,
         }
 
+    def save_as_label(self, ctx) -> dict:
+        """Parse a completed stream and save the result as a FiftyOne label.
+
+        Reads the raw response from the stream file for ``run_id``, detects the
+        grounding format, calls ``to_fiftyone``, and writes the label to the
+        specified field on the sample.
+
+        Parameters (via ctx.params)
+        ---------------------------
+        run_id     : str   Run identifier from ``ask``.
+        sample_id  : str   FiftyOne sample ID to write the label to.
+        field_name : str   Destination field on the sample.
+        detected_format : str  One of ``"box"``, ``"point"``, ``"polygon"``, ``"clip"``.
+        frame_rate : float | None  Video frame rate for clip → frame-index conversion.
+
+        Returns
+        -------
+        dict
+            On success: ``{saved: True, label_type: str, count: int, field: str}``.
+            On failure: ``{error: str}``.
+        """
+        run_id    = ctx.params.get("run_id", "")
+        sample_id = ctx.params.get("sample_id", "")
+        field     = (ctx.params.get("field_name") or "").strip()
+        fmt       = ctx.params.get("detected_format", "")
+        frame_rate = ctx.params.get("frame_rate")
+
+        if not run_id:    return {"error": "No run_id provided."}
+        if not sample_id: return {"error": "No sample_id provided."}
+        if not field:     return {"error": "Field name is required."}
+        if not fmt:       return {"error": "No detected format — nothing to convert."}
+
+        stream_file = _stream_path(run_id)
+        if not stream_file.exists():
+            return {"error": (
+                f"Stream file for run '{run_id}' no longer exists. "
+                "Re-ask the question to generate a new stream."
+            )}
+
+        try:
+            content = stream_file.read_text(encoding="utf-8")
+            fr = float(frame_rate) if frame_rate else None
+            label = to_fiftyone(content, fmt, frame_rate=fr)
+
+            sample = ctx.dataset[sample_id]
+            sample[field] = label
+            sample.save()
+
+            # reload_samples() refreshes the grid and sample viewer without
+            # closing the modal or resetting the view. reload_dataset() is
+            # too aggressive here (triggers a full schema reload that can
+            # close the modal).
+            ctx.ops.reload_samples()
+
+            label_type = type(label).__name__
+            count = _count_label_items(label)
+            return {"saved": True, "label_type": label_type, "count": count, "field": field}
+
+        except Exception as exc:
+            return {"error": f"Parse / save failed: {exc}"}
+
     def render(self, ctx):
         return types.Property(
             types.Object(),
@@ -415,5 +555,6 @@ class PerceptronChatPanel(foo.Panel):
                 composite_view=True,
                 ask=self.ask,
                 get_stream_chunk=self.get_stream_chunk,
+                save_as_label=self.save_as_label,
             ),
         )

@@ -5,8 +5,18 @@ import { usePanelClient } from "./hooks/usePanelClient";
 import type { PanelData, PanelSchema, Turn } from "./types";
 
 // ---------------------------------------------------------------------------
-// Session persistence — survives modal close/reopen within the browser tab.
-// Keyed by sample_id so navigating back to a sample restores its conversation.
+// Logging — prefixed for easy filtering in DevTools (type [perceptron_chat])
+// ---------------------------------------------------------------------------
+
+function log(...args: unknown[]) {
+  console.log("[perceptron_chat]", ...args);
+}
+function logError(...args: unknown[]) {
+  console.error("[perceptron_chat]", ...args);
+}
+
+// ---------------------------------------------------------------------------
+// Session persistence — per-sample in sessionStorage
 // ---------------------------------------------------------------------------
 
 const SESSION_PREFIX = "perceptronChat:";
@@ -32,7 +42,20 @@ function saveSession(sampleId: string, data: StoredSession): void {
 }
 
 // ---------------------------------------------------------------------------
-// Inject global styles (spin keyframe + markdown scoping) — once per page load.
+// Per-turn save state — tracks the Convert to FiftyOne workflow per turn.
+// ---------------------------------------------------------------------------
+
+interface TurnSaveState {
+  fieldName: string;
+  saving: boolean;
+  saved: boolean;
+  savedLabelType?: string;
+  savedCount?: number;
+  error: string | null;
+}
+
+// ---------------------------------------------------------------------------
+// Global style injection (once per page load)
 // ---------------------------------------------------------------------------
 
 let _stylesInjected = false;
@@ -43,31 +66,16 @@ function ensureStyles() {
   el.textContent = `
     @keyframes prcSpin  { to { transform: rotate(360deg); } }
     @keyframes prcBlink { 0%,100%{opacity:1} 50%{opacity:0} }
-
-    /* Scoped markdown styles — all rules under .prc-md */
     .prc-md { font-size: 13px; line-height: 1.7; color: var(--fo-palette-text-primary); word-break: break-word; }
     .prc-md p  { margin: 0 0 8px; }
     .prc-md p:last-child { margin-bottom: 0; }
     .prc-md h1,.prc-md h2,.prc-md h3 { margin: 12px 0 5px; font-weight: 600; }
     .prc-md ul,.prc-md ol { margin: 0 0 8px; padding-left: 18px; }
     .prc-md li { margin-bottom: 2px; }
-    .prc-md code {
-      font-family: ui-monospace, monospace; font-size: 12px;
-      background: var(--fo-palette-background-level2);
-      color: var(--fo-palette-primary-main);
-      padding: 1px 4px; border-radius: 3px;
-    }
-    .prc-md pre {
-      background: var(--fo-palette-background-level2);
-      border: 1px solid var(--fo-palette-divider);
-      border-radius: 4px; padding: 8px 10px; overflow-x: auto; margin: 0 0 8px;
-    }
+    .prc-md code { font-family: ui-monospace, monospace; font-size: 12px; background: var(--fo-palette-background-level2); color: var(--fo-palette-primary-main); padding: 1px 4px; border-radius: 3px; }
+    .prc-md pre { background: var(--fo-palette-background-level2); border: 1px solid var(--fo-palette-divider); border-radius: 4px; padding: 8px 10px; overflow-x: auto; margin: 0 0 8px; }
     .prc-md pre code { background: none; padding: 0; color: var(--fo-palette-text-primary); }
-    .prc-md blockquote {
-      margin: 0 0 8px; padding: 3px 10px;
-      border-left: 3px solid var(--fo-palette-primary-main);
-      color: var(--fo-palette-text-secondary);
-    }
+    .prc-md blockquote { margin: 0 0 8px; padding: 3px 10px; border-left: 3px solid var(--fo-palette-primary-main); color: var(--fo-palette-text-secondary); }
     .prc-md strong { font-weight: 600; }
     .prc-md em    { font-style: italic; }
     .prc-md a     { color: var(--fo-palette-primary-main); }
@@ -76,7 +84,7 @@ function ensureStyles() {
 }
 
 // ---------------------------------------------------------------------------
-// Design tokens — reference FiftyOne CSS variables for automatic theming.
+// Design tokens
 // ---------------------------------------------------------------------------
 
 const V = {
@@ -92,6 +100,18 @@ const V = {
   font:     "var(--fo-fontFamily-body)",
   red:      "#e08080",
   redBg:    "#2a0e0e",
+  green:    "#4caf81",
+  greenBg:  "#0b1a0b",
+  greenBorder: "#1a3a1a",
+};
+
+// Human-readable label for each grounding format.
+const FORMAT_LABELS: Record<string, string> = {
+  box:     "fo.Detections (boxes)",
+  bbox2d:  "fo.Detections (bbox_2d JSON)",
+  point:   "fo.Keypoints",
+  polygon: "fo.Polylines",
+  clip:    "fo.TemporalDetections",
 };
 
 // ---------------------------------------------------------------------------
@@ -111,63 +131,72 @@ const PerceptronChatPanel: React.FC<Props> = ({ data, schema }) => {
   const uris = {
     ask:              schema?.view?.ask              ?? "",
     get_stream_chunk: schema?.view?.get_stream_chunk ?? "",
+    save_as_label:    schema?.view?.save_as_label    ?? "",
   };
-  const { ask, getStreamChunk } = usePanelClient(uris);
+  const { ask, getStreamChunk, saveAsLabel } = usePanelClient(uris);
 
-  // Current sample context pushed by Python lifecycle hooks.
+  // Current sample context pushed by Python.
   const [filepath,  setFilepath]  = useState("");
   const [sampleId,  setSampleId]  = useState("");
   const [mediaType, setMediaType] = useState("image");
+  const [frameRate, setFrameRate] = useState<number | null>(null);
 
-  // Conversation turns — stored per sample in sessionStorage.
-  const [turns,     setTurns]     = useState<Turn[]>([]);
-
-  // Input state.
-  const [question,       setQuestion]       = useState("");
+  // Conversation turns.
+  const [turns,    setTurns]    = useState<Turn[]>([]);
+  const [question, setQuestion] = useState("");
   const [enableThinking, setEnableThinking] = useState(false);
 
-  // Streaming state.
+  // Streaming state for the active (in-progress) turn.
   type StreamState = "idle" | "running" | "done" | "error";
-  const [streamState,    setStreamState]    = useState<StreamState>("idle");
-  const [streamingText,  setStreamingText]  = useState("");   // current assistant turn in progress
-  const [streamError,    setStreamError]    = useState<string | null>(null);
-  const [latencyMs,      setLatencyMs]      = useState<number | null>(null);
-  const [promptTokens,   setPromptTokens]   = useState<number | null>(null);
-  const [completionTok,  setCompletionTok]  = useState<number | null>(null);
+  const [streamState,   setStreamState]   = useState<StreamState>("idle");
+  const [streamingText, setStreamingText] = useState("");
+  const [streamError,   setStreamError]   = useState<string | null>(null);
+  const [latencyMs,     setLatencyMs]     = useState<number | null>(null);
+  const [promptTok,     setPromptTok]     = useState<number | null>(null);
+  const [completionTok, setCompletionTok] = useState<number | null>(null);
 
-  const runIdRef     = useRef("");
-  const cursorRef    = useRef(0);
-  const prevSampleId = useRef("");
-  const scrollRef    = useRef<HTMLDivElement>(null);
-  const inputRef     = useRef<HTMLTextAreaElement>(null);
+  // Per-turn save state (keyed by turn index).
+  const [turnSaveStates, setTurnSaveStates] = useState<Record<number, TurnSaveState>>({});
+
+  const runIdRef      = useRef("");
+  const cursorRef     = useRef(0);
+  const chunkCountRef = useRef(0);
+  const prevSampleId  = useRef("");
+  const scrollRef     = useRef<HTMLDivElement>(null);
 
   useEffect(() => { ensureStyles(); }, []);
 
-  // ── Sync sample from Python lifecycle props ──────────────────────────────
+  // ── Sync sample from Python ───────────────────────────────────────────────
   useEffect(() => {
     const newPath = data?.filepath   ?? "";
     const newId   = data?.sample_id  ?? "";
     const newMt   = data?.media_type ?? "image";
+    const newFr   = data?.frame_rate ?? null;
     if (!newId || !newPath) return;
     if (newId === prevSampleId.current) return;
     prevSampleId.current = newId;
 
+    log("sample synced", { sample_id: newId, filepath: newPath, media_type: newMt, frame_rate: newFr });
+
     setFilepath(newPath);
     setSampleId(newId);
     setMediaType(newMt);
+    setFrameRate(newFr);
     setQuestion("");
     setStreamingText("");
     setStreamState("idle");
     setStreamError(null);
     setLatencyMs(null);
-    setPromptTokens(null);
+    setPromptTok(null);
     setCompletionTok(null);
+    setTurnSaveStates({});
     runIdRef.current  = "";
     cursorRef.current = 0;
+    chunkCountRef.current = 0;
 
-    // Restore conversation for this sample or start fresh.
     const cached = loadSession(newId);
     if (cached) {
+      log("restored session", { sample_id: newId, turns: cached.turns.length });
       setTurns(cached.turns);
       setEnableThinking(cached.enableThinking);
     } else {
@@ -175,13 +204,13 @@ const PerceptronChatPanel: React.FC<Props> = ({ data, schema }) => {
     }
   }, [data?.filepath, data?.sample_id]); // eslint-disable-line
 
-  // ── Persist turns to sessionStorage ──────────────────────────────────────
+  // ── Persist turns ─────────────────────────────────────────────────────────
   useEffect(() => {
     if (!sampleId) return;
     saveSession(sampleId, { turns, enableThinking });
   }, [turns, enableThinking, sampleId]);
 
-  // ── Stream polling — every 250 ms while inference is running ─────────────
+  // ── Stream polling ────────────────────────────────────────────────────────
   useEffect(() => {
     if (streamState !== "running") return;
     const id = setInterval(() => {
@@ -191,39 +220,61 @@ const PerceptronChatPanel: React.FC<Props> = ({ data, schema }) => {
             setStreamingText((prev) => prev + chunk.text);
             cursorRef.current = chunk.cursor;
           }
+          chunkCountRef.current++;
+          // Log every 10th chunk to avoid flooding the console.
+          if (chunkCountRef.current % 10 === 0) {
+            log(`stream chunk #${chunkCountRef.current}`, { cursor: chunk.cursor, done: chunk.done });
+          }
+
           if (chunk.done) {
             clearInterval(id);
             const fs = chunk.final_status;
             if (fs?.status === "error") {
+              logError("stream error", fs.error);
               setStreamError(fs.error ?? "Inference failed.");
               setStreamState("error");
             } else {
+              log("stream done", {
+                run_id:           runIdRef.current,
+                latency_ms:       fs?.latency_ms,
+                prompt_tokens:    fs?.prompt_tokens,
+                completion_tokens: fs?.completion_tokens,
+                detected_format:  fs?.detected_format ?? null,
+              });
               setLatencyMs(fs?.latency_ms ?? null);
-              setPromptTokens(fs?.prompt_tokens ?? null);
+              setPromptTok(fs?.prompt_tokens ?? null);
               setCompletionTok(fs?.completion_tokens ?? null);
               setStreamState("done");
-              // Commit the completed assistant turn to history.
+
+              // Commit the completed assistant turn, carrying metadata for the Convert button.
+              const detectedFmt  = fs?.detected_format ?? null;
+              const defaultField = fs?.default_field ?? "";
+              const committedRunId = runIdRef.current;
               setStreamingText((text) => {
                 setTurns((prev) => {
                   const last = prev[prev.length - 1];
-                  // The user turn was appended optimistically on send;
-                  // now append the completed assistant turn.
                   if (!last || last.role !== "assistant") {
-                    return [...prev, { role: "assistant", content: text }];
+                    return [...prev, {
+                      role:            "assistant",
+                      content:         text,
+                      run_id:          committedRunId,
+                      detected_format: detectedFmt,
+                      default_field:   defaultField,
+                    }];
                   }
                   return prev;
                 });
-                return ""; // clear streaming buffer
+                return "";
               });
             }
           }
         })
-        .catch(() => {});
+        .catch((err) => logError("getStreamChunk error", err));
     }, 250);
     return () => clearInterval(id);
   }, [streamState]); // eslint-disable-line
 
-  // ── Auto-scroll to bottom on new content ─────────────────────────────────
+  // ── Auto-scroll ───────────────────────────────────────────────────────────
   useEffect(() => {
     const el = scrollRef.current;
     if (el) el.scrollTop = el.scrollHeight;
@@ -239,25 +290,28 @@ const PerceptronChatPanel: React.FC<Props> = ({ data, schema }) => {
     setStreamState("running");
     setStreamError(null);
     setLatencyMs(null);
-    setPromptTokens(null);
+    setPromptTok(null);
     setCompletionTok(null);
     cursorRef.current = 0;
+    chunkCountRef.current = 0;
 
-    // Optimistically append the user turn to the visible history.
-    const newUserTurn: Turn = { role: "user", content: q };
-    const historyForApi = [...turns]; // history before this question
-    setTurns((prev) => [...prev, newUserTurn]);
+    const historyForApi = [...turns];
+    setTurns((prev) => [...prev, { role: "user", content: q }]);
+
+    log("ask →", { filepath, media_type: mediaType, history_len: historyForApi.length, enable_thinking: enableThinking });
 
     try {
       const result = await ask({
         filepath,
-        media_type: mediaType,
-        question: q,
-        history: historyForApi,
+        media_type:      mediaType,
+        question:        q,
+        history:         historyForApi,
         enable_thinking: enableThinking,
       });
+      log("ask ← run_id:", result.run_id);
       runIdRef.current = result.run_id;
     } catch (e: any) {
+      logError("ask failed", e?.message);
       setStreamError(e?.message ?? "Request failed.");
       setStreamState("error");
     }
@@ -265,13 +319,59 @@ const PerceptronChatPanel: React.FC<Props> = ({ data, schema }) => {
 
   const handleKeyDown = useCallback(
     (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
-      if (e.key === "Enter" && !e.shiftKey) {
-        e.preventDefault();
-        handleSend();
-      }
+      if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); handleSend(); }
     },
     [handleSend]
   );
+
+  // ── Convert to FiftyOne ───────────────────────────────────────────────────
+  const handleConvert = useCallback(async (turnIdx: number, turn: Turn) => {
+    const state = turnSaveStates[turnIdx];
+    const fieldName = (state?.fieldName ?? turn.default_field ?? "").trim();
+    if (!fieldName || !turn.run_id || !turn.detected_format || !sampleId) return;
+
+    log("convert →", {
+      turn_idx:        turnIdx,
+      run_id:          turn.run_id,
+      detected_format: turn.detected_format,
+      field_name:      fieldName,
+      sample_id:       sampleId,
+      frame_rate:      frameRate,
+    });
+
+    setTurnSaveStates((prev) => ({
+      ...prev,
+      [turnIdx]: { ...prev[turnIdx], fieldName, saving: true, saved: false, error: null },
+    }));
+
+    try {
+      const result = await saveAsLabel({
+        run_id:           turn.run_id,
+        sample_id:        sampleId,
+        field_name:       fieldName,
+        detected_format:  turn.detected_format,
+        frame_rate:       frameRate,
+      });
+      log("convert ←", { label_type: result.label_type, count: result.count, field: result.field });
+      setTurnSaveStates((prev) => ({
+        ...prev,
+        [turnIdx]: {
+          ...prev[turnIdx],
+          saving:          false,
+          saved:           true,
+          savedLabelType:  result.label_type,
+          savedCount:      result.count,
+          error:           null,
+        },
+      }));
+    } catch (e: any) {
+      logError("convert failed", e?.message);
+      setTurnSaveStates((prev) => ({
+        ...prev,
+        [turnIdx]: { ...prev[turnIdx], saving: false, saved: false, error: e?.message ?? "Save failed." },
+      }));
+    }
+  }, [turnSaveStates, sampleId, frameRate, saveAsLabel]);
 
   // ── API key warning ───────────────────────────────────────────────────────
   if (data?.api_key_missing) {
@@ -302,7 +402,7 @@ const PerceptronChatPanel: React.FC<Props> = ({ data, schema }) => {
     );
   }
 
-  const canSend = !!question.trim() && streamState !== "running";
+  const canSend    = !!question.trim() && streamState !== "running";
   const mediaLabel = mediaType === "video" ? "video" : "image";
 
   return (
@@ -338,34 +438,51 @@ const PerceptronChatPanel: React.FC<Props> = ({ data, schema }) => {
         )}
 
         {turns.map((turn, i) => (
-          <div key={i} style={{
-            display: "flex",
-            justifyContent: turn.role === "user" ? "flex-end" : "flex-start",
-            marginBottom: 10,
-          }}>
+          <div key={i} style={{ marginBottom: 10 }}>
+            {/* Bubble */}
             <div style={{
-              maxWidth: "88%",
-              background: turn.role === "user" ? V.primary : V.bg2,
-              color:      turn.role === "user" ? V.textInv  : V.text,
-              borderRadius: turn.role === "user" ? "12px 12px 4px 12px" : "12px 12px 12px 4px",
-              padding:    "8px 12px",
-              fontSize:   13,
-              lineHeight: 1.5,
+              display:        "flex",
+              justifyContent: turn.role === "user" ? "flex-end" : "flex-start",
             }}>
-              {turn.role === "assistant" ? (
-                <div className="prc-md">
-                  <ReactMarkdown remarkPlugins={[remarkGfm]}>
-                    {turn.content}
-                  </ReactMarkdown>
-                </div>
-              ) : (
-                turn.content
-              )}
+              <div style={{
+                maxWidth:     "88%",
+                background:   turn.role === "user" ? V.primary : V.bg2,
+                color:        turn.role === "user" ? V.textInv  : V.text,
+                borderRadius: turn.role === "user" ? "12px 12px 4px 12px" : "12px 12px 12px 4px",
+                padding:      "8px 12px",
+                fontSize:     13,
+                lineHeight:   1.5,
+              }}>
+                {turn.role === "assistant" ? (
+                  <div className="prc-md">
+                    <ReactMarkdown remarkPlugins={[remarkGfm]}>{turn.content}</ReactMarkdown>
+                  </div>
+                ) : (
+                  turn.content
+                )}
+              </div>
             </div>
+
+            {/* Convert to FiftyOne — only for completed assistant turns with grounding output */}
+            {turn.role === "assistant" && turn.detected_format && (
+              <ConvertBar
+                turnIdx={i}
+                turn={turn}
+                saveState={turnSaveStates[i]}
+                onConvert={handleConvert}
+                onFieldChange={(idx, name) =>
+                  setTurnSaveStates((prev) => ({
+                    ...prev,
+                    [idx]: { ...prev[idx], fieldName: name, saved: false, error: null,
+                             saving: false, savedLabelType: undefined, savedCount: undefined },
+                  }))
+                }
+              />
+            )}
           </div>
         ))}
 
-        {/* Streaming assistant turn in progress */}
+        {/* Active streaming turn */}
         {streamState === "running" && (
           <div style={{ display: "flex", justifyContent: "flex-start", marginBottom: 10 }}>
             <div style={{
@@ -375,9 +492,7 @@ const PerceptronChatPanel: React.FC<Props> = ({ data, schema }) => {
             }}>
               {streamingText ? (
                 <div className="prc-md">
-                  <ReactMarkdown remarkPlugins={[remarkGfm]}>
-                    {streamingText}
-                  </ReactMarkdown>
+                  <ReactMarkdown remarkPlugins={[remarkGfm]}>{streamingText}</ReactMarkdown>
                   <span style={{
                     display: "inline-block", width: 2, height: "1em",
                     background: V.primary, marginLeft: 1, verticalAlign: "text-bottom",
@@ -385,23 +500,20 @@ const PerceptronChatPanel: React.FC<Props> = ({ data, schema }) => {
                   }} />
                 </div>
               ) : (
-                /* Waiting for first token */
                 <div style={{ display: "flex", alignItems: "center", gap: 6, color: V.muted }}>
                   <span style={{
                     width: 12, height: 12, borderRadius: "50%",
-                    border: `2px solid ${V.divider}`,
-                    borderTop: `2px solid ${V.primary}`,
+                    border: `2px solid ${V.divider}`, borderTop: `2px solid ${V.primary}`,
                     animation: "prcSpin 0.7s linear infinite",
                     display: "inline-block", flexShrink: 0,
                   }} />
-                  Thinking…
+                  Waiting for response…
                 </div>
               )}
             </div>
           </div>
         )}
 
-        {/* Error display */}
         {streamError && (
           <div style={{ padding: "8px 10px", background: V.redBg, color: V.red,
                         borderRadius: 6, fontSize: 12, marginBottom: 8 }}>
@@ -409,14 +521,12 @@ const PerceptronChatPanel: React.FC<Props> = ({ data, schema }) => {
           </div>
         )}
 
-        {/* Token / latency footer after completion */}
         {streamState === "done" && (latencyMs != null || completionTok != null) && (
-          <div style={{ fontSize: 11, color: V.dim, textAlign: "center",
-                        padding: "2px 0 8px" }}>
+          <div style={{ fontSize: 11, color: V.dim, textAlign: "center", padding: "2px 0 8px" }}>
             {[
               completionTok != null && `${completionTok} tokens`,
               latencyMs    != null && `${(latencyMs / 1000).toFixed(1)}s`,
-              promptTokens != null && `${promptTokens} in`,
+              promptTok    != null && `${promptTok} in`,
             ].filter(Boolean).join(" · ")}
           </div>
         )}
@@ -428,24 +538,19 @@ const PerceptronChatPanel: React.FC<Props> = ({ data, schema }) => {
                     background: V.bg2, display: "flex",
                     flexDirection: "column", gap: 7 }}>
 
-        {/* Thinking toggle */}
         <label style={{ display: "flex", alignItems: "center", gap: 6,
                          cursor: "pointer", userSelect: "none",
                          fontSize: 11, color: V.muted }}>
           <input
-            type="checkbox"
-            checked={enableThinking}
+            type="checkbox" checked={enableThinking}
             onChange={(e) => setEnableThinking(e.target.checked)}
-            style={{ width: 13, height: 13, cursor: "pointer",
-                     accentColor: V.primary, flexShrink: 0 }}
+            style={{ width: 13, height: 13, cursor: "pointer", accentColor: V.primary, flexShrink: 0 }}
           />
           Enable thinking (slower, better for reasoning)
         </label>
 
-        {/* Textarea + send button */}
         <div style={{ display: "flex", gap: 6, alignItems: "flex-end" }}>
           <textarea
-            ref={inputRef}
             value={question}
             onChange={(e) => setQuestion(e.target.value)}
             onKeyDown={handleKeyDown}
@@ -457,53 +562,33 @@ const PerceptronChatPanel: React.FC<Props> = ({ data, schema }) => {
             }
             rows={1}
             style={{
-              flex:         1,
-              background:   streamState === "running" ? V.bg : V.bg,
-              color:        streamState === "running" ? V.dim : V.text,
-              border:       `1px solid ${V.divider}`,
-              borderRadius: 6,
-              padding:      "7px 10px",
-              fontSize:     13,
-              fontFamily:   V.font,
-              lineHeight:   1.5,
-              outline:      "none",
-              resize:       "none" as const,
-              minHeight:    38,
-              overflow:     "auto",
-              boxSizing:    "border-box" as const,
-              cursor:       streamState === "running" ? "not-allowed" : "text",
+              flex: 1, background: V.bg, color: streamState === "running" ? V.dim : V.text,
+              border: `1px solid ${V.divider}`, borderRadius: 6,
+              padding: "7px 10px", fontSize: 13, fontFamily: V.font,
+              lineHeight: 1.5, outline: "none", resize: "none" as const,
+              minHeight: 38, overflow: "auto", boxSizing: "border-box" as const,
+              cursor: streamState === "running" ? "not-allowed" : "text",
             }}
           />
           <button
-            onClick={handleSend}
-            disabled={!canSend}
+            onClick={handleSend} disabled={!canSend}
             title="Send (Enter)"
             style={{
-              background:   "none",
-              border:       "none",
-              padding:      "0 2px",
-              cursor:       canSend ? "pointer" : "default",
-              color:        streamState === "running"
-                              ? V.muted
-                              : canSend ? V.primary : V.dim,
-              opacity:      canSend || streamState === "running" ? 1 : 0.35,
-              lineHeight:   1,
-              display:      "flex",
-              alignItems:   "center",
-              flexShrink:   0,
-              marginBottom: 6,
+              background: "none", border: "none", padding: "0 2px",
+              cursor:  canSend ? "pointer" : "default",
+              color:   streamState === "running" ? V.muted : canSend ? V.primary : V.dim,
+              opacity: canSend || streamState === "running" ? 1 : 0.35,
+              lineHeight: 1, display: "flex", alignItems: "center",
+              flexShrink: 0, marginBottom: 6,
             }}
           >
             {streamState === "running" ? (
               <span style={{
                 width: 16, height: 16, borderRadius: "50%",
-                border: `2px solid ${V.divider}`,
-                borderTop: `2px solid ${V.primary}`,
-                animation: "prcSpin 0.7s linear infinite",
-                display: "inline-block",
+                border: `2px solid ${V.divider}`, borderTop: `2px solid ${V.primary}`,
+                animation: "prcSpin 0.7s linear infinite", display: "inline-block",
               }} />
             ) : (
-              /* Paper plane icon */
               <svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor">
                 <path d="M2.01 21L23 12 2.01 3 2 10l15 2-15 2z" />
               </svg>
@@ -511,7 +596,6 @@ const PerceptronChatPanel: React.FC<Props> = ({ data, schema }) => {
           </button>
         </div>
 
-        {/* Clear conversation */}
         {turns.length > 0 && streamState !== "running" && (
           <div style={{ display: "flex", justifyContent: "flex-end" }}>
             <button
@@ -520,6 +604,8 @@ const PerceptronChatPanel: React.FC<Props> = ({ data, schema }) => {
                 setStreamingText("");
                 setStreamState("idle");
                 setStreamError(null);
+                setTurnSaveStates({});
+                log("conversation cleared for sample", sampleId);
               }}
               style={{
                 background: "none", border: "none", cursor: "pointer",
@@ -532,6 +618,121 @@ const PerceptronChatPanel: React.FC<Props> = ({ data, schema }) => {
           </div>
         )}
       </div>
+    </div>
+  );
+};
+
+// ---------------------------------------------------------------------------
+// ConvertBar — rendered below each completed assistant turn that has grounding
+// output. Contains the field-name input and the Convert button.
+// ---------------------------------------------------------------------------
+
+interface ConvertBarProps {
+  turnIdx:       number;
+  turn:          Turn;
+  saveState:     TurnSaveState | undefined;
+  onConvert:     (idx: number, turn: Turn) => void;
+  onFieldChange: (idx: number, name: string) => void;
+}
+
+const ConvertBar: React.FC<ConvertBarProps> = ({
+  turnIdx, turn, saveState, onConvert, onFieldChange,
+}) => {
+  const fieldName  = saveState?.fieldName ?? turn.default_field ?? "";
+  const saving     = saveState?.saving    ?? false;
+  const saved      = saveState?.saved     ?? false;
+  const saveError  = saveState?.error     ?? null;
+  const fmtLabel   = FORMAT_LABELS[turn.detected_format ?? ""] ?? turn.detected_format;
+  const canConvert = !!fieldName.trim() && !saving && !saved;
+
+  return (
+    <div style={{
+      marginTop:    6,
+      marginLeft:   0,
+      padding:      "7px 10px",
+      background:   V.bg3,
+      borderRadius: "0 0 8px 8px",
+      border:       `1px solid ${V.divider}`,
+      borderTop:    "none",
+      display:      "flex",
+      flexDirection: "column" as const,
+      gap:          5,
+    }}>
+      {/* Format badge */}
+      <div style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 11, color: V.muted }}>
+        <span style={{
+          fontSize: 10, padding: "1px 6px", borderRadius: 8,
+          background: V.bg2, color: V.primary,
+          border: `1px solid ${V.divider}`,
+        }}>
+          {fmtLabel}
+        </span>
+        <span>detected — save to dataset?</span>
+      </div>
+
+      {/* Field name input + Convert button */}
+      <div style={{ display: "flex", gap: 6, alignItems: "center" }}>
+        <input
+          type="text"
+          value={fieldName}
+          onChange={(e) => onFieldChange(turnIdx, e.target.value)}
+          disabled={saving || saved}
+          placeholder="field name"
+          style={{
+            flex:         1,
+            background:   (saving || saved) ? V.bg : V.bg2,
+            color:        (saving || saved) ? V.muted : V.text,
+            border:       `1px solid ${V.divider}`,
+            borderRadius: 4,
+            padding:      "4px 8px",
+            fontSize:     11,
+            fontFamily:   "ui-monospace, monospace",
+            outline:      "none",
+            cursor:       (saving || saved) ? "not-allowed" : "text",
+          }}
+        />
+        <button
+          onClick={() => onConvert(turnIdx, { ...turn, default_field: fieldName })}
+          disabled={!canConvert}
+          title={saved ? "Already saved" : `Save as ${fmtLabel} to field "${fieldName}"`}
+          style={{
+            background:   saved  ? V.greenBg  : canConvert ? V.bg2 : V.bg,
+            color:        saved  ? V.green     : canConvert ? V.text : V.dim,
+            border:       `1px solid ${saved ? V.greenBorder : V.divider}`,
+            borderRadius: 4,
+            padding:      "4px 10px",
+            fontSize:     11,
+            fontFamily:   V.font,
+            cursor:       canConvert ? "pointer" : "not-allowed",
+            flexShrink:   0,
+            whiteSpace:   "nowrap" as const,
+            display:      "flex",
+            alignItems:   "center",
+            gap:          4,
+          }}
+        >
+          {saving ? (
+            <>
+              <span style={{
+                width: 10, height: 10, borderRadius: "50%",
+                border: `2px solid ${V.divider}`, borderTop: `2px solid ${V.primary}`,
+                animation: "prcSpin 0.7s linear infinite", display: "inline-block",
+              }} />
+              Saving…
+            </>
+          ) : saved ? (
+            `✓ ${saveState?.savedCount ?? ""} ${saveState?.savedLabelType ?? ""}`
+          ) : (
+            "Convert to FiftyOne ▶"
+          )}
+        </button>
+      </div>
+
+      {saveError && (
+        <div style={{ fontSize: 11, color: V.red, padding: "2px 0" }}>
+          {saveError}
+        </div>
+      )}
     </div>
   );
 };

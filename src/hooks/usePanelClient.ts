@@ -1,23 +1,22 @@
 import { useCallback } from "react";
 import { usePanelEvent } from "@fiftyone/operators";
-import type { AskResult, StreamChunk, Turn } from "../types";
+import type { AskResult, SaveLabelResult, StreamChunk, Turn } from "../types";
 
 interface PanelUris {
-  ask: string;
+  ask:              string;
   get_stream_chunk: string;
+  save_as_label:    string;
 }
 
 /**
  * Bridge to the Python PerceptronChatPanel methods.
  *
  * Each method wraps ``usePanelEvent`` in a Promise so callers can use
- * async/await. Python-side errors (``result.result.error``) surface as
- * rejected Promises.
+ * async/await. Python-side ``{error}`` responses surface as rejected Promises.
  */
 export function usePanelClient(uris: PanelUris) {
   const handleEvent = usePanelEvent();
 
-  // Generic typed caller so each method is one line.
   const call = useCallback(
     <T>(methodName: string, uri: string, params: Record<string, unknown>): Promise<T> =>
       new Promise((resolve, reject) => {
@@ -51,5 +50,16 @@ export function usePanelClient(uris: PanelUris) {
     [call, uris.get_stream_chunk]
   );
 
-  return { ask, getStreamChunk };
+  const saveAsLabel = useCallback(
+    (params: {
+      run_id: string;
+      sample_id: string;
+      field_name: string;
+      detected_format: string;
+      frame_rate: number | null;
+    }) => call<SaveLabelResult>("save_as_label", uris.save_as_label, params),
+    [call, uris.save_as_label]
+  );
+
+  return { ask, getStreamChunk, saveAsLabel };
 }

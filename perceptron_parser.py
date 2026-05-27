@@ -455,6 +455,67 @@ def _classifications_from_json(parsed: Any, *, multi: bool) -> fo.Classification
 
 
 # ---------------------------------------------------------------------------
+# bbox_2d JSON parsing. The model occasionally returns a JSON array instead
+# of XML tags, especially for box grounding in chat contexts:
+#
+#     [{"bbox_2d": [x1, y1, x2, y2], "label": "left front wheel"}, ...]
+#
+# Coordinates are in the 0-1000 normalized space (same as XML tag output).
+# We extract the JSON substring to tolerate prose before/after the array.
+# ---------------------------------------------------------------------------
+
+
+def _parse_bbox2d_json(content: str, *, target: str | None) -> fo.Detections:
+    """Parse a JSON ``bbox_2d`` array into `fo.Detections`.
+
+    Tolerates surrounding prose by finding the first ``[`` … last ``]`` in the
+    content. Each object must have a ``bbox_2d`` list of four numbers and an
+    optional ``label`` string. Coordinates are in the 0-1000 normalized space;
+    they are divided by ``COORD_MAX`` to produce FiftyOne [0, 1] relative coords.
+    """
+    # Extract the JSON array substring — model may include prose around it.
+    start = content.find("[")
+    end   = content.rfind("]")
+    if start == -1 or end == -1 or end < start:
+        logger.info("[perceptron] bbox_2d: no JSON array found in content")
+        return fo.Detections(detections=[])
+
+    try:
+        parsed = json.loads(content[start : end + 1])
+    except json.JSONDecodeError as exc:
+        logger.info("[perceptron] bbox_2d: JSON parse error (%s)", exc)
+        return fo.Detections(detections=[])
+
+    if not isinstance(parsed, list):
+        logger.info("[perceptron] bbox_2d: expected a list, got %s", type(parsed).__name__)
+        return fo.Detections(detections=[])
+
+    detections: list[fo.Detection] = []
+    for item in parsed:
+        if not isinstance(item, dict):
+            continue
+        bbox = item.get("bbox_2d")
+        if not isinstance(bbox, (list, tuple)) or len(bbox) < 4:
+            logger.info("[perceptron] bbox_2d: skipping item with missing/invalid bbox_2d: %r", item)
+            continue
+
+        label = str(item.get("label") or target or "object")
+        # Normalize from [0, 1000] to [0, 1] and ensure x1<x2, y1<y2.
+        x1, y1, x2, y2 = (float(v) / COORD_MAX for v in bbox[:4])
+        if x2 < x1:
+            x1, x2 = x2, x1
+        if y2 < y1:
+            y1, y2 = y2, y1
+        detections.append(fo.Detection(
+            label=label,
+            bounding_box=[x1, y1, x2 - x1, y2 - y1],
+        ))
+
+    logger.info("[perceptron] parsed %d bbox_2d detection(s)", len(detections))
+    return fo.Detections(detections=detections)
+
+
+# ---------------------------------------------------------------------------
 # Top-level dispatch.
 # ---------------------------------------------------------------------------
 
@@ -469,10 +530,11 @@ def to_fiftyone(
     """Convert the API's raw response text to a FiftyOne label container.
 
     ``annotation_format`` values and their output types:
-        * ``"box"``              -> `fo.Detections`
+        * ``"box"``              -> `fo.Detections` (via ``<point_box>`` tags)
         * ``"point"``            -> `fo.Keypoints`
         * ``"polygon"``          -> `fo.Polylines`
         * ``"clip"``             -> `fo.TemporalDetections`
+        * ``"bbox2d"``           -> `fo.Detections` (via JSON ``bbox_2d`` array)
         * ``"vqa"`` | ``"caption"`` | ``"ocr_text"`` -> ``str`` (tags stripped)
         * ``"classify_single"``  -> `fo.Classification`
         * ``"classify_multi"``   -> `fo.Classifications`
@@ -515,6 +577,8 @@ def to_fiftyone(
             return _parse_polygons(content, target=target)
         case "clip":
             return _parse_clip_tags(content, frame_rate=frame_rate)
+        case "bbox2d":
+            return _parse_bbox2d_json(content, target=target)
         case "vqa" | "caption" | "ocr_text":
             cleaned = strip_tags(content).strip()
             logger.info("[perceptron] free-text result: %d chars", len(cleaned))
@@ -530,7 +594,7 @@ def to_fiftyone(
 def _empty_container_for(annotation_format: str) -> FOLabel:
     """Return the empty FiftyOne container matching ``annotation_format``."""
     match annotation_format:
-        case "box":
+        case "box" | "bbox2d":
             return fo.Detections(detections=[])
         case "point":
             return fo.Keypoints(keypoints=[])

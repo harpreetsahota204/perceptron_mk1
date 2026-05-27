@@ -1722,10 +1722,23 @@ def _mode_requires_frame_rate(ctx: Any, mode: str) -> bool:
         case "bootstrap":
             task_str = ctx.params.get("bootstrap_task")
             if not task_str:
-                # No task selected yet; default to requiring metadata so the
-                # gate fires early for video datasets, then re-renders when
-                # the user picks a task.
-                return True
+                # No task selected yet. Use the media-type-appropriate default
+                # task to decide: TRACK (video) needs frame_rate; DETECT
+                # (image) doesn't. Resolves grouped datasets the same way
+                # resolve_input does.
+                try:
+                    raw_mt = ctx.dataset.media_type
+                    if raw_mt == "group":
+                        slice_types = set(ctx.dataset.group_media_types.values())
+                        raw_mt = slice_types.pop() if len(slice_types) == 1 else "video"
+                    default_task = (
+                        _BOOTSTRAP_VIDEO_TASKS[0]
+                        if raw_mt == "video"
+                        else _BOOTSTRAP_IMAGE_TASKS[0]
+                    )
+                    return task_supports_per_frame(default_task)
+                except Exception:
+                    return True  # conservative fallback
             try:
                 return task_supports_per_frame(Task(task_str))
             except ValueError:
