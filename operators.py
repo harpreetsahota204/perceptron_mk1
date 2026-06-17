@@ -289,7 +289,7 @@ _SEMANTIC_SEARCH_RESPONSE_FORMAT: dict[str, Any] = {
     },
 }
 
-_SEMANTIC_SEARCH_TEMPLATE: str = "Does this video match this description: {query}"
+_SEMANTIC_SEARCH_TEMPLATE: str = "Does this sample match this description: {query}"
 _SEMANTIC_DEFAULT_THRESHOLD: float = 0.7
 
 # Ticker flush interval while a single API call is in flight. 0.5s is fast
@@ -776,37 +776,112 @@ def _render_bootstrap_inputs(inputs: Any, ctx: Any, *, media_type: str) -> None:
         default=_BOOTSTRAP_TASK_LONG.get(task, ""),
     )
 
-    # Caption and KEY_MOMENTS tasks have no target input.
+    # Caption and KEY_MOMENTS tasks have no target input — skip the whole block.
     spec = _TARGET_FIELD_SPEC.get(task)
-    if spec is not None:
-        class_view = types.ListView()
-        inputs.list(
-            "bootstrap_target",
-            types.String(),
-            label=spec["label"],
-            required=spec.get("required", False),
-            description=spec.get("description", ""),
-            view=class_view,
-        )
+    prompt_source = "classes"  # default; overridden below when spec exists
 
-    # Live prompt preview. Uses the spec label as the placeholder when the
-    # target is empty so users see the grammar even before they start typing.
-    _raw_target = ctx.params.get("bootstrap_target") or []
-    if isinstance(_raw_target, list):
-        target = ", ".join(t.strip() for t in _raw_target if t and t.strip())
-    else:
-        target = str(_raw_target).strip()
-    placeholder = f"<{spec['label'].lower()}>" if spec else None
-    preview_target = target or placeholder
-    try:
-        preview = default_user_prompt(task, preview_target, media_type=media_type)
+    if spec is not None:
+        # ── Target source toggle ───────────────────────────────────────────────
+        # The user can either type the target directly ("classes") or read it
+        # per-sample from a dataset field ("field"). These are mutually exclusive.
+        source_view = types.RadioView()
+        source_view.add_choice("classes", label=f"Enter {spec['label'].lower()}")
+        source_view.add_choice("field", label="Read from sample field")
+        inputs.enum(
+            "bootstrap_prompt_source",
+            source_view.values(),
+            default="classes",
+            required=True,
+            label="Target source",
+            view=source_view,
+        )
+        prompt_source = ctx.params.get("bootstrap_prompt_source", "classes")
+
+        if prompt_source == "classes":
+            # ── Static target ──────────────────────────────────────────────────
+            class_view = types.ListView()
+            inputs.list(
+                "bootstrap_target",
+                types.String(),
+                label=spec["label"],
+                required=spec.get("required", False),
+                description=spec.get("description", ""),
+                view=class_view,
+            )
+        else:
+            # ── Per-sample field ───────────────────────────────────────────────
+            inputs.str(
+                "bootstrap_prompt_prefix",
+                label="Prompt prefix (optional)",
+                description=(
+                    f"Text prepended to the field value to form the full prompt "
+                    f"(e.g. for a VQA question: ``What is the ``). "
+                    f"Leave blank to use the field value as the entire prompt."
+                ),
+                required=False,
+            )
+
+            str_field_names = sorted(
+                name for name, fld in ctx.dataset.get_field_schema().items()
+                if isinstance(fld, fo.StringField) and not name.startswith("_")
+                and name not in ("id", "filepath")
+            )
+            if str_field_names:
+                field_choices = types.DropdownView()
+                for fn in str_field_names:
+                    field_choices.add_choice(fn, label=fn)
+                inputs.enum(
+                    "bootstrap_prompt_field",
+                    field_choices.values(),
+                    default=str_field_names[0],
+                    required=True,
+                    label="Prompt field",
+                    description=(
+                        "String field whose value is used as (or appended to the "
+                        "prefix to form) the prompt for each sample. Samples with "
+                        "an empty field value fall back to the default prompt."
+                    ),
+                    view=field_choices,
+                )
+            else:
+                inputs.str(
+                    "_no_string_fields_notice",
+                    view=types.MarkdownView(read_only=True),
+                    default=(
+                        "> **No string fields found.** Add a string field to your "
+                        "dataset first (e.g. `dataset.add_sample_field('my_prompt', "
+                        "fo.StringField())`)."
+                    ),
+                )
+
+    # ── Live prompt preview ───────────────────────────────────────────────────
+    if prompt_source == "field":
+        _prompt_prefix = (ctx.params.get("bootstrap_prompt_prefix") or "").strip()
+        _prompt_field  = ctx.params.get("bootstrap_prompt_field") or ""
+        # Show prefix + field name as a placeholder (actual value varies per sample).
+        preview_text = f"{_prompt_prefix}<{_prompt_field}>" if _prompt_prefix else f"<{_prompt_field}>"
         inputs.str(
             "_prompt_preview",
             view=types.MarkdownView(read_only=True),
-            default=f"**Prompt:** `{preview}`",
+            default=f"**Prompt (per sample):** `{preview_text}`",
         )
-    except ValueError:
-        pass  # task requires a target but none is typed yet; skip the preview
+    else:
+        _raw_target = ctx.params.get("bootstrap_target") or []
+        if isinstance(_raw_target, list):
+            target_str = ", ".join(t.strip() for t in _raw_target if t and t.strip())
+        else:
+            target_str = str(_raw_target).strip()
+        placeholder = f"<{spec['label'].lower()}>" if spec else None
+        preview_target = target_str or placeholder
+        try:
+            preview = default_user_prompt(task, preview_target, media_type=media_type)
+            inputs.str(
+                "_prompt_preview",
+                view=types.MarkdownView(read_only=True),
+                default=f"**Prompt:** `{preview}`",
+            )
+        except ValueError:
+            pass  # task requires a target but none typed yet; skip the preview
 
     # Dense path (TRACK) needs stride / max_frames controls + cost preview.
     if task_supports_per_frame(task):
@@ -824,9 +899,9 @@ def _render_bootstrap_inputs(inputs: Any, ctx: Any, *, media_type: str) -> None:
 def _render_dense_controls(inputs: Any, ctx: Any) -> None:
     """Stride / max_frames inputs + a cost-preview Markdown row.
 
-    Only rendered when a dense task (TRACK, KEYPOINTS) is selected. The cost
-    preview multiplies the per-sample request count by the target-view size
-    to give an honest "this will make X API calls" estimate.
+    Rendered only when TRACK (the one remaining dense task) is selected. The
+    cost preview multiplies the per-sample request count by the target-view
+    size to give an honest "this will make X API calls" estimate.
     """
     inputs.int(
         "bootstrap_stride",
@@ -1368,6 +1443,7 @@ async def _execute_bootstrap(
     elapsed_s = time.perf_counter() - started_at
 
     usage = model.usage_totals
+    prompt_source = ctx.params.get("bootstrap_prompt_source", "classes")
     run_key = _register_custom_run(
         ctx,
         version=version,
@@ -1375,7 +1451,11 @@ async def _execute_bootstrap(
         summary={
             "mode": MODE_BOOTSTRAP,
             "task": task.value,
+            # Record how the prompt was sourced for auditability.
+            "prompt_source": prompt_source,
             "target": target,
+            "prompt_field": ctx.params.get("bootstrap_prompt_field") or None,
+            "prompt_prefix": (ctx.params.get("bootstrap_prompt_prefix") or "").strip() or None,
             "field": field,
             "n_total": total,
             "n_labels": n_labels,
@@ -1468,6 +1548,10 @@ def _build_model(
     ``response_format`` is the optional caller-side override (Semantic Search
     passes a yes/no-constrained json_schema). When absent, the model class
     applies the default CLASSIFY schema for classify tasks.
+
+    ``prompt_prefix`` and ``prompt_field`` support per-sample prompts: if
+    ``prompt_field`` is set the model reads that field value from each sample
+    and (optionally) prepends ``prompt_prefix`` to form the final prompt.
     """
     stride_param = ctx.params.get("bootstrap_stride")
     max_frames_param = ctx.params.get("bootstrap_max_frames")
@@ -1477,6 +1561,8 @@ def _build_model(
         "media_type": ctx.dataset.media_type,
         "target": target,
         "prompt": prompt,
+        "prompt_prefix": (ctx.params.get("bootstrap_prompt_prefix") or "").strip() or None,
+        "prompt_field": ctx.params.get("bootstrap_prompt_field") or None,
         "enable_thinking": bool(ctx.params.get("enable_thinking", False)),
         "focus": bool(ctx.params.get("focus", False)),
         "api_key": get_api_key(ctx),
@@ -1703,7 +1789,11 @@ def _mode_requires_frame_rate(ctx: Any, mode: str) -> bool:
                     )
                     return task_supports_per_frame(default_task)
                 except Exception:
-                    return True  # conservative fallback
+                    logger.warning(
+                        "[perceptron] _mode_requires_frame_rate: could not resolve "
+                        "default task; assuming frame_rate required"
+                    )
+                    return True  # conservative: block the form rather than pass a bad run through
             try:
                 return task_supports_per_frame(Task(task_str))
             except ValueError:

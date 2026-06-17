@@ -105,7 +105,16 @@ class PerceptronConfig:
             classify aspect, or VQA question, depending on ``task``.
             Validated by `default_user_prompt`.
         prompt: Override for the auto-generated user prompt. ``None`` -> use
-            `prompts.default_user_prompt`.
+            `prompts.default_user_prompt`. Takes precedence over
+            ``prompt_prefix`` / ``prompt_field``.
+        prompt_prefix: Optional text prepended to the per-sample field value
+            when ``prompt_field`` is set (e.g. ``"Count the "``). Ignored
+            when ``prompt_field`` is not set or the field value is empty.
+        prompt_field: Name of a sample-level string field whose value is used
+            as (or appended to ``prompt_prefix`` to form) the user prompt.
+            Enables a different prompt for every sample without rebuilding
+            the model. When the field value is empty the default template
+            from `prompts.default_user_prompt` is used as a fallback.
         enable_thinking: Sets ``vision_config.enable_thinking``. Off by
             default -- thinking is expensive and can demote structured
             output to prose for weakly-prompted clip tasks.
@@ -132,6 +141,8 @@ class PerceptronConfig:
     media_type: str = "video"
     target: str | None = None
     prompt: str | None = None
+    prompt_prefix: str | None = None
+    prompt_field: str | None = None
     enable_thinking: bool = False
     focus: bool = False
     max_completion_tokens: int = DEFAULT_MAX_COMPLETION_TOKENS
@@ -177,6 +188,8 @@ class PerceptronModel(Model):
             media_type=str(cfg_dict.get("media_type", "video")),
             target=cfg_dict.get("target"),
             prompt=cfg_dict.get("prompt"),
+            prompt_prefix=cfg_dict.get("prompt_prefix") or None,
+            prompt_field=cfg_dict.get("prompt_field") or None,
             enable_thinking=bool(cfg_dict.get("enable_thinking", False)),
             focus=bool(cfg_dict.get("focus", False)),
             max_completion_tokens=int(
@@ -264,12 +277,12 @@ class PerceptronModel(Model):
         if self._config.task in TASKS_DENSE_IMAGE_MODE:
             return self._predict_dense(filepath, sample)
         if self._config.task in TASKS_IMAGE_GROUNDING or self._config.media_type == "image":
-            return self._predict_image(filepath)
+            return self._predict_image(filepath, sample)
         return self._predict_video(filepath, sample)
 
     # -- Image-mode predict (one ``image_url`` request) --------------------------
 
-    def _predict_image(self, filepath: str) -> FOLabel:
+    def _predict_image(self, filepath: str, sample: fo.Sample | None = None) -> FOLabel:
         """Single-shot inference on one image file.
 
         Reads the image bytes from disk, infers the MIME type, and sends a
@@ -277,7 +290,7 @@ class PerceptronModel(Model):
         """
         image_bytes = Path(filepath).read_bytes()
         mime = mimetypes.guess_type(filepath)[0] or "image/jpeg"
-        prompt = self._resolve_prompt()
+        prompt = self._resolve_prompt(sample)
         messages = self._build_image_messages(jpeg_bytes=image_bytes, prompt=prompt, mime=mime)
         vision_config = self._build_vision_config()
         response_format = self._build_response_format()
@@ -315,7 +328,7 @@ class PerceptronModel(Model):
         request. Returns a sample-level label container (TemporalDetections for
         clip tasks, Classification/str for shared tasks).
         """
-        prompt = self._resolve_prompt()
+        prompt = self._resolve_prompt(sample)
         messages = self._build_video_messages(video_path=filepath, prompt=prompt)
         vision_config = self._build_vision_config()
         response_format = self._build_response_format()
@@ -379,7 +392,8 @@ class PerceptronModel(Model):
         if self._config.max_frames is not None and self._config.max_frames > 0:
             indices = indices[: self._config.max_frames]
 
-        prompt = self._resolve_prompt()
+        # Dense path: prompt is resolved once per sample (same across all frames).
+        prompt = self._resolve_prompt(sample)
         vision_config = self._build_vision_config()
         parser_format = self.parser_format
 
@@ -434,17 +448,38 @@ class PerceptronModel(Model):
 
     # -- Internal helpers --------------------------------------------------------
 
-    def _resolve_prompt(self) -> str:
-        """Return the configured prompt override, or the default template."""
+    def _resolve_prompt(self, sample: fo.Sample | None = None) -> str:
+        """Return the user prompt for this request.
+
+        Resolution order:
+        1. ``config.prompt`` — explicit override always wins.
+        2. ``config.prompt_field`` — read the field value from ``sample`` and
+           prepend ``config.prompt_prefix``. Falls back to the default
+           template when the field value is empty/None.
+        3. Default template from ``prompts.default_user_prompt``.
+        """
         if self._config.prompt:
             return self._config.prompt
+
+        if self._config.prompt_field and sample is not None:
+            field_value = sample.get_field(self._config.prompt_field)
+            if field_value:
+                prefix = self._config.prompt_prefix or ""
+                return f"{prefix}{field_value}"
+            logger.warning(
+                "[perceptron] sample %s has no value for prompt_field=%r; "
+                "falling back to default prompt",
+                sample.id,
+                self._config.prompt_field,
+            )
+
         return default_user_prompt(
             self._config.task,
             self._config.target,
             media_type=self._config.media_type,
         )
 
-    def _build_vision_config(self) -> dict[str, Any] | None:
+    def _build_vision_config(self) -> dict[str, Any]:
         """Compose the ``vision_config`` extension for this task.
 
         Sent via OpenAI's ``extra_body``. Supported ``annotation_format``
@@ -452,9 +487,6 @@ class PerceptronModel(Model):
         ``annotation_format`` and ``enable_thinking`` are only added when
         relevant. ``internal_tools.focus`` is always included so the API
         receives the user's preference regardless of task type.
-
-        Note: Mk1 currently returns bbox-shaped polygons for polygon tasks
-        rather than true contour polygons. The parser handles both shapes.
         """
         cfg: dict[str, Any] = {}
         fmt = TASK_TO_API_FORMAT[self._config.task]
@@ -538,24 +570,16 @@ class PerceptronModel(Model):
 
     @staticmethod
     def _extract_frame_rate(sample: fo.Sample | None) -> float | None:
-        """``sample.metadata.frame_rate`` if available, else ``None``."""
-        if sample is None:
-            return None
-        metadata = sample.metadata
-        if metadata is None:
-            return None
-        frame_rate = getattr(metadata, "frame_rate", None)
-        return float(frame_rate) if frame_rate else None
+        """``sample.metadata.frame_rate`` cast to float, or ``None``."""
+        meta = sample.metadata if sample is not None else None
+        fr = getattr(meta, "frame_rate", None) if meta is not None else None
+        return float(fr) if fr else None
 
     @staticmethod
     def _extract_frame_count(sample: fo.Sample | None) -> int | None:
-        """``sample.metadata.total_frame_count`` if available, else ``None``."""
-        if sample is None:
-            return None
-        metadata = sample.metadata
-        if metadata is None:
-            return None
-        n = getattr(metadata, "total_frame_count", None)
+        """``sample.metadata.total_frame_count`` cast to int, or ``None``."""
+        meta = sample.metadata if sample is not None else None
+        n = getattr(meta, "total_frame_count", None) if meta is not None else None
         return int(n) if n else None
 
     def _read_video_dimensions(

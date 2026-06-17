@@ -53,6 +53,7 @@ from pathlib import Path
 from typing import Any
 
 import bson
+import logging
 from fiftyone import ViewField as F
 from openai import OpenAI
 
@@ -63,6 +64,8 @@ from ._shared import get_api_key, has_api_key
 from .perceptron_api import to_image_data_uri, to_video_data_uri
 from .perceptron_model import DEFAULT_MODEL_NAME
 from .perceptron_parser import to_fiftyone
+
+logger = logging.getLogger("perceptron")
 
 # ---------------------------------------------------------------------------
 # Runtime file locations — OUTSIDE the plugin directory to avoid invalidating
@@ -238,7 +241,7 @@ def _run_stream_thread(
     except Exception:
         tb = traceback.format_exc()
         _write_json(_status_path(run_id), {"status": "error", "error": tb})
-        print(f"[perceptron_chat] inference error:\n{tb}")
+        logger.error("[perceptron] chat stream error:\n%s", tb)
 
 
 # ---------------------------------------------------------------------------
@@ -320,7 +323,7 @@ class PerceptronChatPanel(foo.Panel):
                         sample_id  = slice_sample.id
                         media_type = getattr(slice_sample, "media_type", None) or "image"
                 except Exception as exc:
-                    print(f"[perceptron_chat] slice lookup error: {exc}")
+                    logger.warning("[perceptron] group-slice lookup error: %s", exc)
 
         # frame_rate is needed by save_as_label to convert clip timestamps
         # to frame indices. Read from the already-resolved sample to avoid
@@ -530,10 +533,14 @@ class PerceptronChatPanel(foo.Panel):
         fmt       = ctx.params.get("detected_format", "")
         frame_rate = ctx.params.get("frame_rate")
 
-        if not run_id:    return {"error": "No run_id provided."}
-        if not sample_id: return {"error": "No sample_id provided."}
-        if not field:     return {"error": "Field name is required."}
-        if not fmt:       return {"error": "No detected format — nothing to convert."}
+        if not run_id:
+            return {"error": "No run_id provided."}
+        if not sample_id:
+            return {"error": "No sample_id provided."}
+        if not field:
+            return {"error": "Field name is required."}
+        if not fmt:
+            return {"error": "No detected format — nothing to convert."}
 
         stream_file = _stream_path(run_id)
         if not stream_file.exists():

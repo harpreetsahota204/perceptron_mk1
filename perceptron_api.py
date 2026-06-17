@@ -250,21 +250,35 @@ class PerceptronClient:
 
     @staticmethod
     def _log_response_summary(response: Any, attempt: int) -> None:
-        """Log id / finish_reason / usage from a chat-completions response."""
+        """Log id / finish_reason / usage from a chat-completions response.
+
+        ``response.usage`` is `None` on rare 200 responses that lack a usage
+        block (seen in the wild); guard defensively rather than crashing.
+        """
         choice = response.choices[0]
-        usage = response.usage
+        usage = getattr(response, "usage", None)
         content_preview = _truncate((choice.message.content or "").replace("\n", " "))
-        logger.info(
-            "[perceptron] response id=%s attempt=%d finish_reason=%s "
-            "tokens={prompt=%d completion=%d total=%d} content=%r",
-            response.id,
-            attempt,
-            choice.finish_reason,
-            usage.prompt_tokens,
-            usage.completion_tokens,
-            usage.total_tokens,
-            content_preview,
-        )
+        if usage is not None:
+            logger.info(
+                "[perceptron] response id=%s attempt=%d finish_reason=%s "
+                "tokens={prompt=%d completion=%d total=%d} content=%r",
+                response.id,
+                attempt,
+                choice.finish_reason,
+                usage.prompt_tokens,
+                usage.completion_tokens,
+                usage.total_tokens,
+                content_preview,
+            )
+        else:
+            logger.info(
+                "[perceptron] response id=%s attempt=%d finish_reason=%s "
+                "tokens=unavailable content=%r",
+                response.id,
+                attempt,
+                choice.finish_reason,
+                content_preview,
+            )
 
 
 def _last_user_text_preview(messages: list[dict[str, Any]]) -> str:

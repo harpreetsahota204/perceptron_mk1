@@ -995,39 +995,30 @@ def _write_items_to_frames(
     Returns:
         Summary dict (see `write_per_frame_labels`).
     """
+    # `_seconds_to_frame` already guarantees frame_rate is valid and returns
+    # a 1-indexed int (min 1). The assert is a refactor-safety net.
     by_frame: dict[int, list[Any]] = {}
     for item in items:
         idx = _seconds_to_frame(item.t, frame_rate)
-        # We checked frame_rate above; _seconds_to_frame can't return None here,
-        # but assert it explicitly so a refactor doesn't silently break.
-        assert idx is not None  # noqa: S101 -- internal invariant after frame_rate guard
+        assert idx is not None  # noqa: S101 -- invariant: frame_rate was validated above
         by_frame.setdefault(idx, []).append(item)
 
-    # Pick the right container constructor per item type. We know items are
-    # uniform because they came from the same Detections / Keypoints container.
-    # TRACK is the only dense task that reaches this path and always produces
-    # fo.Detections, but keep the TypeError explicit so a future refactor
-    # can't silently produce wrong output.
+    # TRACK is the only dense task and always produces fo.Detection items.
+    # The isinstance guard catches accidental misuse if a future task is added.
     example = items[0]
-    match example:
-        case fo.Detection():
-            container_cls = fo.Detections
-            container_kwarg = "detections"
-        case _:
-            raise TypeError(
-                f"_write_items_to_frames: unexpected item type "
-                f"{type(example).__name__}; expected fo.Detection"
-            )
+    if not isinstance(example, fo.Detection):
+        raise TypeError(
+            f"_write_items_to_frames: expected fo.Detection items, "
+            f"got {type(example).__name__}"
+        )
 
     for frame_idx, batch in sorted(by_frame.items()):
-        frame_key = max(1, frame_idx)  # FiftyOne uses 1-indexed frames
-        frame = sample.frames[frame_key]
-        frame[field] = container_cls(**{container_kwarg: batch})
+        # frame_idx is already 1-indexed (see _seconds_to_frame).
+        sample.frames[frame_idx][field] = fo.Detections(detections=batch)
 
     sample.save()
     logger.info(
-        "[perceptron] wrote per-frame %s to sample[%s]: %d label(s) across %d frame(s)",
-        type(example).__name__ + "s",
+        "[perceptron] wrote per-frame Detections to sample[%s]: %d label(s) across %d frame(s)",
         field,
         len(items),
         len(by_frame),
